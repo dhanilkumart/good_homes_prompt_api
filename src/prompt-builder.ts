@@ -1,5 +1,5 @@
-import { getCategoryObjectRules, itemExplicitlyRequestedByUser } from "./category-rules";
-import type { GenerateRequest, PlanTier } from "./types";
+import { getCategoryObjectRules, itemExplicitlyRequestedByUser } from "./category-rules.js";
+import type { GenerateRequest, PlanTier } from "./types.js";
 
 export type PromptBuildResult = {
   prompt: string;

@@ -1,8 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import { z } from "zod";
-import { buildPromptAndContext } from "./prompt-builder";
-import { normalizePlanTier, type GenerateRequest } from "./types";
+import { buildPromptAndContext } from "./prompt-builder.js";
+import { normalizePlanTier, type GenerateRequest } from "./types.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
