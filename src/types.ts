@@ -1,7 +1,7 @@
 export type PlanTier = "basic" | "plus" | "pro";
 
 export interface GenerateRequest {
-  image: string;
+  image: string | null;
   category: string;
   prompt?: string;
   planTier?: PlanTier | string;
@@ -16,8 +16,18 @@ export interface GenerateRequest {
   perspective: string;
   session?: {
     sessionId: string;
+    floorPlanHash?: string | null;
     previousRenderedImages?: string[];
     latestRenderedImage?: string | null;
+    firstRenderedImage?: string | null;
+    initialConfig?: {
+      category: string;
+      ceilingHeight: string;
+      wallColor: string;
+      tileStyle: string;
+      furnitureStyle: string;
+      customPrompt: string;
+    };
   };
   requirementsJson?: Record<string, unknown>;
   additionalFeatures?: Record<string, unknown>;
