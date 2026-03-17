@@ -260,6 +260,25 @@ function normalizeControl(value: unknown): string {
   return text.toLowerCase() === "none" ? "auto" : text;
 }
 
+function buildWallColorPolicyLine(wallColor: string): string {
+  const normalized = normalizeControl(wallColor);
+  if (normalized === "auto") {
+    return "Wall paint rule: if no wall color is selected, choose one harmonious paint color that matches flooring and furniture and keep it consistent across all walls.";
+  }
+  if (/^#[0-9A-Fa-f]{3,8}$/.test(normalized)) {
+    return `Wall paint rule: match the selected wall color exactly (${normalized}) with high fidelity under neutral interior lighting.`;
+  }
+  return `Wall paint rule: match the selected wall color "${normalized}" as the dominant painted wall tone with high fidelity.`;
+}
+
+function buildWallColorHardConstraintLine(wallColor: string): string {
+  const normalized = normalizeControl(wallColor);
+  if (normalized === "auto") {
+    return "- Keep all walls as painted surfaces (no wall tiles/cladding). Pick one harmonious wall paint color and keep it consistent.";
+  }
+  return `- Keep all walls as painted surfaces (no wall tiles/cladding). Wall paint color must stay faithful to: ${normalized}.`;
+}
+
 function normalizePromptForMatching(value: string): string {
   return value
     .toLowerCase()
@@ -582,14 +601,20 @@ function detectContinuationChange(params: {
   body: GenerateRequest;
   controls: EffectivePromptControls;
   overrides: CustomPromptOverrides;
+  userPrompt: string;
 }): string {
-  const { body, controls, overrides } = params;
+  const { body, controls, overrides, userPrompt } = params;
+  const hasCustomInstruction = Boolean(String(userPrompt || "").trim());
   const initialConfig = body.session?.initialConfig;
   if (!initialConfig) {
     if (overrides.perspective) {
-      return `Apply only this change: camera perspective -> ${controls.perspective}.`;
+      return hasCustomInstruction
+        ? `Base parameter change: camera perspective -> ${controls.perspective}.`
+        : `Apply only this change: camera perspective -> ${controls.perspective}.`;
     }
-    return "No explicit parameter diff found; preserve everything exactly and apply only user-requested material/style edit.";
+    return hasCustomInstruction
+      ? "No explicit parameter diff found. Apply Additional user instruction while preserving room geometry and camera unless explicitly overridden."
+      : "No explicit parameter diff found; preserve everything exactly and apply only user-requested material/style edit.";
   }
 
   const changes: string[] = [];
@@ -629,14 +654,20 @@ function detectContinuationChange(params: {
   }
 
   if (changes.length === 1) {
-    return `Apply only this change: ${changes[0]}.`;
+    return hasCustomInstruction
+      ? `Base parameter change: ${changes[0]}.`
+      : `Apply only this change: ${changes[0]}.`;
   }
 
   if (changes.length > 1) {
-    return `Apply only these changes together: ${changes.join(", ")}.`;
+    return hasCustomInstruction
+      ? `Base parameter changes: ${changes.join(", ")}.`
+      : `Apply only these changes together: ${changes.join(", ")}.`;
   }
 
-  return "No clear tile/paint/furniture diff detected; preserve geometry and camera and only apply explicit user edit text.";
+  return hasCustomInstruction
+    ? "No base parameter diff detected. Apply Additional user instruction while preserving room geometry/camera lock unless explicitly requested."
+    : "No clear tile/paint/furniture diff detected; preserve geometry and camera and only apply explicit user edit text.";
 }
 
 function buildGenerationPrompt(params: {
@@ -651,6 +682,8 @@ function buildGenerationPrompt(params: {
 }): string {
   const cameraDescription = perspectiveToCamera(normalizeControl(params.controls.perspective));
   const ceilingDescription = ceilingToDescription(normalizeControl(params.controls.ceilingHeight));
+  const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
+  const wallColorHardConstraintLine = buildWallColorHardConstraintLine(params.controls.wallColor);
 
   const materialsBlock = [
     `- Tile/flooring: ${normalizeControl(params.controls.tile)}`,
@@ -658,6 +691,7 @@ function buildGenerationPrompt(params: {
     "- Tile placement policy: if tile/flooring is specified, apply it only on floor surfaces.",
     "- Tile size policy: if tile/flooring is specified, render as uniform 4x4 square tiles with realistic grout joints.",
     `- Paint color: ${normalizeControl(params.controls.wallColor)}`,
+    `- ${wallColorPolicyLine}`,
     `- Furniture style: ${normalizeControl(params.controls.furniture)}`,
   ]
     .filter(Boolean)
@@ -669,6 +703,7 @@ function buildGenerationPrompt(params: {
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
+    wallColorHardConstraintLine,
     "- Do not render as a diagram or sketch or floor plan view.",
     "- Do not hallucinate any elements.",
   ].join("\n");
@@ -687,6 +722,7 @@ function buildGenerationPrompt(params: {
     `Camera and perspective: ${cameraDescription}.`,
     `Ceiling guidance: ${ceilingDescription}.`,
     `Realism rules: ${params.snippet.realismRules}`,
+    "Decor accent: optionally add at most one subtle framed wall painting/artwork if it naturally fits the room type; otherwise keep walls clean.",
     params.overridesSummary
       ? `Custom prompt structured overrides (highest priority):\n${params.overridesSummary}`
       : "",
@@ -710,18 +746,31 @@ function buildContinuationPrompt(params: {
   overridesSummary: string;
   tileReferenceDescriptor: string;
 }): string {
+  const hasCustomInstruction = Boolean(String(params.userPrompt || "").trim());
+  const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
+  const wallColorHardConstraintLine = buildWallColorHardConstraintLine(params.controls.wallColor);
   const hardConstraints = [
     "- Lock room geometry exactly as previous generated image.",
     params.allowPerspectiveChange
       ? "- Camera angle may change only if explicitly requested in additional user instruction."
       : "- Lock camera angle exactly as previous generated image.",
-    "- Apply only the changed parameter(s) listed above.",
+    hasCustomInstruction
+      ? "- Apply both: (1) base parameter change(s) listed above and (2) Additional user instruction."
+      : "- Apply only the changed parameter(s) listed above.",
+    hasCustomInstruction
+      ? "- Additional user instruction has higher priority over template defaults; keep edits limited to requested changes."
+      : "",
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
-    "- Do not alter object positions, walls, openings, proportions, or composition.",
+    wallColorHardConstraintLine,
+    hasCustomInstruction
+      ? "- Keep walls, openings, and structural proportions fixed. Object-level additions/styling are allowed only if requested above."
+      : "- Do not alter object positions, walls, openings, proportions, or composition.",
     "- Do not render as diagram/sketch/floor-plan style.",
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   return [
     "Photorealistic architectural interior rendering update.",
@@ -730,6 +779,7 @@ function buildContinuationPrompt(params: {
     "EDIT / CONTINUATION MODE:",
     params.changeInstruction,
     params.tileReferenceDescriptor ? `Tile reference details: ${params.tileReferenceDescriptor}` : "",
+    wallColorPolicyLine,
     `Camera template guidance: ${params.snippet.camera}`,
     params.allowPerspectiveChange
       ? `Camera and perspective override: ${perspectiveToCamera(normalizeControl(params.controls.perspective))}.`
@@ -793,7 +843,7 @@ export async function buildPromptAndContext(
       controls,
       allowPerspectiveChange: Boolean(overrides.perspective),
       userPrompt,
-      changeInstruction: detectContinuationChange({ body, controls, overrides }),
+      changeInstruction: detectContinuationChange({ body, controls, overrides, userPrompt }),
       overridesSummary,
       tileReferenceDescriptor,
     });
