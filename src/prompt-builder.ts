@@ -33,6 +33,26 @@ type VisibleElement = {
   count: number;
 };
 
+type CustomPromptOverrides = {
+  perspective?: string;
+  tile?: string;
+  wallColor?: string;
+  furniture?: string;
+};
+
+type EffectivePromptControls = {
+  perspective: string;
+  ceilingHeight: string;
+  tile: string;
+  wallColor: string;
+  furniture: string;
+};
+
+type SynonymEntry = {
+  canonical: string;
+  phrases: string[];
+};
+
 const CATEGORY_SNIPPETS: Record<CategoryKey, CategorySnippet> = {
   bathroom: {
     label: "Bathroom",
@@ -161,11 +181,171 @@ const CATEGORY_SNIPPETS: Record<CategoryKey, CategorySnippet> = {
   },
 };
 
+const PERSPECTIVE_SYNONYMS: SynonymEntry[] = [
+  {
+    canonical: "top view",
+    phrases: ["top view", "ceiling view", "overhead view", "bird eye view", "birds eye view", "aerial view"],
+  },
+  {
+    canonical: "view from the bed",
+    phrases: ["view from bed", "view from the bed", "from bed view", "bed view", "bedside view"],
+  },
+  {
+    canonical: "from door view of area",
+    phrases: ["door view", "from door", "entrance view", "from entrance", "entry view"],
+  },
+  {
+    canonical: "wide corner view",
+    phrases: ["corner view", "wide view", "wide angle view", "wide-angle view"],
+  },
+];
+
+const TILE_SYNONYMS: SynonymEntry[] = [
+  { canonical: "White Marble", phrases: ["white marble"] },
+  { canonical: "Black Marble", phrases: ["black marble"] },
+  { canonical: "Carrara Marble", phrases: ["carrara marble"] },
+  { canonical: "Calacatta", phrases: ["calacatta"] },
+  { canonical: "Oak Wood", phrases: ["oak wood"] },
+  { canonical: "Walnut Wood", phrases: ["walnut wood"] },
+  { canonical: "Ash Wood", phrases: ["ash wood"] },
+  { canonical: "Herringbone Oak", phrases: ["herringbone oak"] },
+  { canonical: "Chevron Walnut", phrases: ["chevron walnut"] },
+  { canonical: "Grey Concrete", phrases: ["grey concrete", "gray concrete"] },
+  { canonical: "White Concrete", phrases: ["white concrete"] },
+  { canonical: "Terrazzo Classic", phrases: ["terrazzo classic"] },
+  { canonical: "Terrazzo Modern", phrases: ["terrazzo modern"] },
+  { canonical: "Subway White", phrases: ["subway white"] },
+  { canonical: "Subway Black", phrases: ["subway black"] },
+  { canonical: "Hexagon White", phrases: ["hexagon white"] },
+  { canonical: "Hexagon Marble", phrases: ["hexagon marble"] },
+  { canonical: "Slate Grey", phrases: ["slate grey", "slate gray"] },
+  { canonical: "Travertine", phrases: ["travertine"] },
+  { canonical: "Mosaic Blue", phrases: ["mosaic blue"] },
+  { canonical: "Penny Round", phrases: ["penny round"] },
+  { canonical: "Zellige", phrases: ["zellige"] },
+  { canonical: "black tile", phrases: ["black tile", "black tiles"] },
+  { canonical: "blue tile", phrases: ["blue tile", "blue tiles"] },
+  { canonical: "grey tile", phrases: ["grey tile", "gray tile", "grey tiles", "gray tiles"] },
+  { canonical: "white tile", phrases: ["white tile", "white tiles"] },
+];
+
+const WALL_COLOR_SYNONYMS: SynonymEntry[] = [
+  { canonical: "Off White", phrases: ["off white"] },
+  { canonical: "Cream", phrases: ["cream wall", "cream color", "cream paint", "cream"] },
+  { canonical: "Beige", phrases: ["beige wall", "beige color", "beige paint", "beige"] },
+  { canonical: "Sky", phrases: ["sky blue", "sky wall", "sky"] },
+  { canonical: "Sage", phrases: ["sage green", "sage wall", "sage"] },
+  { canonical: "Blush", phrases: ["blush", "blush pink"] },
+  { canonical: "Lavender", phrases: ["lavender"] },
+  { canonical: "Charcoal", phrases: ["charcoal", "dark gray wall", "dark grey wall"] },
+  { canonical: "Navy", phrases: ["navy", "navy blue"] },
+  { canonical: "Walnut", phrases: ["walnut wall", "walnut brown"] },
+  { canonical: "Forest", phrases: ["forest green", "forest"] },
+  { canonical: "blue", phrases: ["blue wall", "blue paint"] },
+  { canonical: "black", phrases: ["black wall", "black paint"] },
+  { canonical: "white", phrases: ["white wall", "white paint"] },
+];
+
+const FURNITURE_SYNONYMS: SynonymEntry[] = [
+  { canonical: "Minimal", phrases: ["minimal furniture", "minimal style", "minimalist furniture", "minimalist"] },
+  { canonical: "Modern", phrases: ["modern furniture", "modern style", "contemporary furniture", "contemporary"] },
+  { canonical: "Classic", phrases: ["classic furniture", "classic style", "traditional furniture", "traditional"] },
+  { canonical: "None", phrases: ["no furniture", "without furniture", "empty room furniture"] },
+];
+
 function normalizeControl(value: unknown): string {
   if (value === null || value === undefined || value === "") return "auto";
   const text = String(value).trim();
   if (!text) return "auto";
   return text.toLowerCase() === "none" ? "auto" : text;
+}
+
+function normalizePromptForMatching(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9#\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripUiAutoCriticalInstruction(value: string): string {
+  return value
+    .replace(
+      /\s*CRITICAL INSTRUCTION:\s*Only change the following specific items from the provided image:[\s\S]*$/i,
+      ""
+    )
+    .trim();
+}
+
+function findBestSynonymMatch(normalizedPrompt: string, entries: SynonymEntry[]): string | undefined {
+  let bestCanonical: string | undefined;
+  let bestLength = -1;
+
+  for (const entry of entries) {
+    for (const phrase of entry.phrases) {
+      const normalizedPhrase = normalizePromptForMatching(phrase);
+      if (!normalizedPhrase) continue;
+      if (!normalizedPrompt.includes(normalizedPhrase)) continue;
+      if (normalizedPhrase.length > bestLength) {
+        bestLength = normalizedPhrase.length;
+        bestCanonical = entry.canonical;
+      }
+    }
+  }
+
+  return bestCanonical;
+}
+
+function detectPerspectiveOverride(normalizedPrompt: string): string | undefined {
+  return findBestSynonymMatch(normalizedPrompt, PERSPECTIVE_SYNONYMS);
+}
+
+function extractCustomPromptAndOverrides(rawPrompt: string | undefined): {
+  userPrompt: string;
+  overrides: CustomPromptOverrides;
+} {
+  const cleanedPrompt = stripUiAutoCriticalInstruction(String(rawPrompt || ""));
+  const normalizedPrompt = normalizePromptForMatching(cleanedPrompt);
+
+  const overrides: CustomPromptOverrides = {};
+  const perspective = detectPerspectiveOverride(normalizedPrompt);
+  const tile = findBestSynonymMatch(normalizedPrompt, TILE_SYNONYMS);
+  const wall = findBestSynonymMatch(normalizedPrompt, WALL_COLOR_SYNONYMS);
+  const furniture = findBestSynonymMatch(normalizedPrompt, FURNITURE_SYNONYMS);
+
+  if (perspective) overrides.perspective = perspective;
+  if (tile) overrides.tile = tile;
+  if (wall) overrides.wallColor = wall;
+  if (furniture) overrides.furniture = furniture;
+
+  const wallHexMatch = cleanedPrompt.match(/#[0-9A-Fa-f]{3,8}\b/);
+  if (wallHexMatch && /wall|paint|color/i.test(cleanedPrompt)) {
+    overrides.wallColor = wallHexMatch[0];
+  }
+
+  return {
+    userPrompt: cleanedPrompt,
+    overrides,
+  };
+}
+
+function resolveEffectiveControls(body: GenerateRequest, overrides: CustomPromptOverrides): EffectivePromptControls {
+  return {
+    perspective: normalizeControl(overrides.perspective || body.perspective),
+    ceilingHeight: normalizeControl(body.ceilingHeight),
+    tile: normalizeControl(overrides.tile || body.tileName || body.tile),
+    wallColor: normalizeControl(overrides.wallColor || body.wallColor),
+    furniture: normalizeControl(overrides.furniture || body.furnitureName || body.furniture),
+  };
+}
+
+function buildOverridesSummary(overrides: CustomPromptOverrides, controls: EffectivePromptControls): string {
+  const lines: string[] = [];
+  if (overrides.perspective) lines.push(`- Camera/view override: ${controls.perspective}`);
+  if (overrides.tile) lines.push(`- Tile/flooring override: ${controls.tile}`);
+  if (overrides.wallColor) lines.push(`- Paint color override: ${controls.wallColor}`);
+  if (overrides.furniture) lines.push(`- Furniture style override: ${controls.furniture}`);
+  return lines.join("\n");
 }
 
 function normalizeCategoryKey(value: string): CategoryKey {
@@ -189,11 +369,17 @@ function polishPromptText(value: string | undefined): string {
 
 function perspectiveToCamera(perspective: string): string {
   const p = perspective.toLowerCase();
-  if (p.includes("isometric") || p.includes("top") || p.includes("aerial")) {
+  if (p.includes("isometric") || p.includes("top") || p.includes("aerial") || p.includes("ceiling") || p.includes("overhead")) {
     return "isometric aerial 3D view from a 45-degree elevated angle showing complete room layout";
+  }
+  if (p.includes("bed")) {
+    return "human eye-level interior perspective from the bed-side, looking across the room layout";
   }
   if (p.includes("eye") || p.includes("human") || p.includes("walkthrough")) {
     return "human eye-level perspective standing inside the room and looking toward the main feature wall";
+  }
+  if (p.includes("door") || p.includes("entrance") || p.includes("entry")) {
+    return "human eye-level architectural interior perspective from an entrance-facing position";
   }
   if (p.includes("corner") || p.includes("wide")) {
     return "wide-angle corner perspective capturing both wall depth and primary furniture arrangement";
@@ -392,30 +578,54 @@ async function runTileReferenceAnalysis(params: {
   return String(result.tileDescriptor || "").trim();
 }
 
-function detectContinuationChange(body: GenerateRequest): string {
+function detectContinuationChange(params: {
+  body: GenerateRequest;
+  controls: EffectivePromptControls;
+  overrides: CustomPromptOverrides;
+}): string {
+  const { body, controls, overrides } = params;
   const initialConfig = body.session?.initialConfig;
   if (!initialConfig) {
+    if (overrides.perspective) {
+      return `Apply only this change: camera perspective -> ${controls.perspective}.`;
+    }
     return "No explicit parameter diff found; preserve everything exactly and apply only user-requested material/style edit.";
   }
 
   const changes: string[] = [];
 
-  const currentTile = normalizeControl(body.tile);
-  const initialTile = normalizeControl(initialConfig.tileStyle === "auto" ? "none" : initialConfig.tileStyle);
-  if (currentTile !== initialTile) {
-    changes.push(`tile/flooring -> ${normalizeControl(body.tileName || body.tile)}`);
+  if (overrides.tile) {
+    changes.push(`tile/flooring -> ${controls.tile}`);
+  } else {
+    const currentTile = normalizeControl(body.tile);
+    const initialTile = normalizeControl(initialConfig.tileStyle === "auto" ? "none" : initialConfig.tileStyle);
+    if (currentTile !== initialTile) {
+      changes.push(`tile/flooring -> ${normalizeControl(body.tileName || body.tile)}`);
+    }
   }
 
-  const currentWall = normalizeControl(body.wallColor);
-  const initialWall = normalizeControl(initialConfig.wallColor);
-  if (currentWall !== initialWall) {
-    changes.push(`paint color -> ${normalizeControl(body.wallColor)}`);
+  if (overrides.wallColor) {
+    changes.push(`paint color -> ${controls.wallColor}`);
+  } else {
+    const currentWall = normalizeControl(body.wallColor);
+    const initialWall = normalizeControl(initialConfig.wallColor);
+    if (currentWall !== initialWall) {
+      changes.push(`paint color -> ${normalizeControl(body.wallColor)}`);
+    }
   }
 
-  const currentFurniture = normalizeControl(body.furniture);
-  const initialFurniture = normalizeControl(initialConfig.furnitureStyle === "auto" ? "none" : initialConfig.furnitureStyle);
-  if (currentFurniture !== initialFurniture) {
-    changes.push(`furniture style -> ${normalizeControl(body.furnitureName || body.furniture)}`);
+  if (overrides.furniture) {
+    changes.push(`furniture style -> ${controls.furniture}`);
+  } else {
+    const currentFurniture = normalizeControl(body.furniture);
+    const initialFurniture = normalizeControl(initialConfig.furnitureStyle === "auto" ? "none" : initialConfig.furnitureStyle);
+    if (currentFurniture !== initialFurniture) {
+      changes.push(`furniture style -> ${normalizeControl(body.furnitureName || body.furniture)}`);
+    }
+  }
+
+  if (overrides.perspective) {
+    changes.push(`camera perspective -> ${controls.perspective}`);
   }
 
   if (changes.length === 1) {
@@ -433,19 +643,22 @@ function buildGenerationPrompt(params: {
   snippet: CategorySnippet;
   selectedCategoryLabel: string;
   elementPlacementBlock: string;
-  body: GenerateRequest;
+  controls: EffectivePromptControls;
   userPrompt: string;
+  overridesSummary: string;
   floorPlanAnalysis: string;
   tileReferenceDescriptor: string;
 }): string {
-  const cameraDescription = perspectiveToCamera(normalizeControl(params.body.perspective));
-  const ceilingDescription = ceilingToDescription(normalizeControl(params.body.ceilingHeight));
+  const cameraDescription = perspectiveToCamera(normalizeControl(params.controls.perspective));
+  const ceilingDescription = ceilingToDescription(normalizeControl(params.controls.ceilingHeight));
 
   const materialsBlock = [
-    `- Tile/flooring: ${normalizeControl(params.body.tileName || params.body.tile)}`,
+    `- Tile/flooring: ${normalizeControl(params.controls.tile)}`,
     params.tileReferenceDescriptor ? `- Tile reference details: ${params.tileReferenceDescriptor}` : "",
-    `- Paint color: ${normalizeControl(params.body.wallColor)}`,
-    `- Furniture style: ${normalizeControl(params.body.furnitureName || params.body.furniture)}`,
+    "- Tile placement policy: if tile/flooring is specified, apply it only on floor surfaces.",
+    "- Tile size policy: if tile/flooring is specified, render as uniform 4x4 square tiles with realistic grout joints.",
+    `- Paint color: ${normalizeControl(params.controls.wallColor)}`,
+    `- Furniture style: ${normalizeControl(params.controls.furniture)}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -453,6 +666,9 @@ function buildGenerationPrompt(params: {
   const hardConstraints = [
     "- Do not add any rooms or spaces not present in the floor plan.",
     "- Do not add furniture not listed in the element placement block.",
+    "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
+    "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
+    "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
     "- Do not render as a diagram or sketch or floor plan view.",
     "- Do not hallucinate any elements.",
   ].join("\n");
@@ -471,6 +687,9 @@ function buildGenerationPrompt(params: {
     `Camera and perspective: ${cameraDescription}.`,
     `Ceiling guidance: ${ceilingDescription}.`,
     `Realism rules: ${params.snippet.realismRules}`,
+    params.overridesSummary
+      ? `Custom prompt structured overrides (highest priority):\n${params.overridesSummary}`
+      : "",
     params.floorPlanAnalysis ? `Structural reference from floor plan analysis: ${params.floorPlanAnalysis}` : "",
     params.userPrompt ? `Additional user instruction: ${params.userPrompt}` : "",
     "Hard constraints:",
@@ -484,14 +703,22 @@ function buildGenerationPrompt(params: {
 
 function buildContinuationPrompt(params: {
   snippet: CategorySnippet;
-  body: GenerateRequest;
+  controls: EffectivePromptControls;
+  allowPerspectiveChange: boolean;
   userPrompt: string;
   changeInstruction: string;
+  overridesSummary: string;
   tileReferenceDescriptor: string;
 }): string {
   const hardConstraints = [
-    "- Lock room geometry and camera angle exactly as previous generated image.",
-    "- Apply only the changed parameter (tile or paint or furniture).",
+    "- Lock room geometry exactly as previous generated image.",
+    params.allowPerspectiveChange
+      ? "- Camera angle may change only if explicitly requested in additional user instruction."
+      : "- Lock camera angle exactly as previous generated image.",
+    "- Apply only the changed parameter(s) listed above.",
+    "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
+    "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
+    "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
     "- Do not alter object positions, walls, openings, proportions, or composition.",
     "- Do not render as diagram/sketch/floor-plan style.",
   ].join("\n");
@@ -504,8 +731,13 @@ function buildContinuationPrompt(params: {
     params.changeInstruction,
     params.tileReferenceDescriptor ? `Tile reference details: ${params.tileReferenceDescriptor}` : "",
     `Camera template guidance: ${params.snippet.camera}`,
-    `Camera and perspective: preserve exact previous perspective (${normalizeControl(params.body.perspective)}).`,
+    params.allowPerspectiveChange
+      ? `Camera and perspective override: ${perspectiveToCamera(normalizeControl(params.controls.perspective))}.`
+      : `Camera and perspective: preserve exact previous perspective (${normalizeControl(params.controls.perspective)}).`,
     `Realism rules: ${params.snippet.realismRules}`,
+    params.overridesSummary
+      ? `Custom prompt structured overrides (highest priority):\n${params.overridesSummary}`
+      : "",
     params.userPrompt ? `Additional user instruction: ${params.userPrompt}` : "",
     "Hard constraints:",
     hardConstraints,
@@ -528,19 +760,25 @@ export async function buildPromptAndContext(
   const categoryKey = normalizeCategoryKey(body.category);
   const snippet = CATEGORY_SNIPPETS[categoryKey];
   const isBathroomCategory = categoryKey === "bathroom";
-  const userPrompt = polishPromptText(body.prompt);
-  const hasTileReference = Boolean(body.tileImage) && !["none", "auto"].includes(normalizeControl(body.tile));
+  const { userPrompt: cleanedUserPrompt, overrides } = extractCustomPromptAndOverrides(body.prompt);
+  const userPrompt = polishPromptText(cleanedUserPrompt);
+  const controls = resolveEffectiveControls(body, overrides);
+  const hasTileReference =
+    Boolean(body.tileImage) &&
+    !["none", "auto"].includes(normalizeControl(body.tile)) &&
+    !Boolean(overrides.tile);
   let tileReferenceDescriptor = "";
+  const overridesSummary = buildOverridesSummary(overrides, controls);
 
   if (hasTileReference && typeof body.tileImage === "string") {
     try {
       tileReferenceDescriptor = await runTileReferenceAnalysis({
         tileImageDataUrl: body.tileImage,
-        tileName: normalizeControl(body.tileName || body.tile),
+        tileName: normalizeControl(controls.tile),
       });
     } catch (error) {
       console.warn("[Prompt Builder] Tile reference analysis failed. Continuing without tile descriptor.", {
-        tile: normalizeControl(body.tileName || body.tile),
+        tile: normalizeControl(controls.tile),
         error: error instanceof Error ? error.message : String(error),
       });
       tileReferenceDescriptor = "";
@@ -552,9 +790,11 @@ export async function buildPromptAndContext(
   if (isContinuation) {
     prompt = buildContinuationPrompt({
       snippet,
-      body,
+      controls,
+      allowPerspectiveChange: Boolean(overrides.perspective),
       userPrompt,
-      changeInstruction: detectContinuationChange(body),
+      changeInstruction: detectContinuationChange({ body, controls, overrides }),
+      overridesSummary,
       tileReferenceDescriptor,
     });
   } else {
@@ -581,8 +821,9 @@ export async function buildPromptAndContext(
       snippet,
       selectedCategoryLabel: snippet.label,
       elementPlacementBlock: formatElementPlacementBlock(elements),
-      body,
+      controls,
       userPrompt,
+      overridesSummary,
       floorPlanAnalysis,
       tileReferenceDescriptor,
     });
