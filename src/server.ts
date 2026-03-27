@@ -46,6 +46,21 @@ function summarizeDataUrl(value: unknown) {
   };
 }
 
+function summarizeCustomAssets(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((asset) => {
+    const record = asset && typeof asset === "object"
+      ? (asset as Record<string, unknown>)
+      : {};
+    return {
+      id: record.id || null,
+      name: record.name || null,
+      promptLength: record.prompt ? String(record.prompt).length : 0,
+      hasPreviewUrl: Boolean(record.previewUrl),
+    };
+  });
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -76,7 +91,20 @@ app.post("/build-prompt", async (req, res) => {
       tile: (body as GenerateRequest)?.tile || null,
       tileName: (body as GenerateRequest)?.tileName || null,
       tileImageSummary: summarizeDataUrl((body as GenerateRequest)?.tileImage),
+      curtain: (body as GenerateRequest)?.curtain || null,
+      curtainName: (body as GenerateRequest)?.curtainName || null,
+      curtainImageSummary: summarizeDataUrl((body as GenerateRequest)?.curtainImage),
+      wallpaper: (body as GenerateRequest)?.wallpaper || null,
+      wallpaperName: (body as GenerateRequest)?.wallpaperName || null,
+      wallpaperImageSummary: summarizeDataUrl((body as GenerateRequest)?.wallpaperImage),
       furniture: (body as GenerateRequest)?.furniture || null,
+      fabric: (body as GenerateRequest)?.fabric || null,
+      fabricName: (body as GenerateRequest)?.fabricName || null,
+      fabricImageSummary: summarizeDataUrl((body as GenerateRequest)?.fabricImage),
+      customAssetsCount: Array.isArray((body as GenerateRequest)?.customAssets)
+        ? (body as GenerateRequest).customAssets!.length
+        : 0,
+      customAssetsSummary: summarizeCustomAssets((body as GenerateRequest)?.customAssets),
       promptLength: (body as GenerateRequest)?.prompt ? String((body as GenerateRequest).prompt).length : 0,
       hasImage: Boolean((body as GenerateRequest)?.image),
       imageSummary: summarizeDataUrl((body as GenerateRequest)?.image),

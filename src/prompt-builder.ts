@@ -42,11 +42,24 @@ type CustomPromptOverrides = {
 
 type EffectivePromptControls = {
   perspective: string;
-  ceilingHeight: string;
   tile: string;
+  curtain: string;
+  wallpaper: string;
   wallColor: string;
   furniture: string;
+  fabric: string;
 };
+
+type ReferenceAssetKind = "tile" | "curtain" | "wallpaper" | "fabric";
+
+type ReferenceAssetDescriptors = {
+  tile: string;
+  curtain: string;
+  wallpaper: string;
+  fabric: string;
+};
+
+type CustomAssetReference = NonNullable<GenerateRequest["customAssets"]>[number];
 
 type SynonymEntry = {
   canonical: string;
@@ -351,10 +364,12 @@ function extractCustomPromptAndOverrides(rawPrompt: string | undefined): {
 function resolveEffectiveControls(body: GenerateRequest, overrides: CustomPromptOverrides): EffectivePromptControls {
   return {
     perspective: normalizeControl(overrides.perspective || body.perspective),
-    ceilingHeight: normalizeControl(body.ceilingHeight),
     tile: normalizeControl(overrides.tile || body.tileName || body.tile),
+    curtain: normalizeControl(body.curtainName || body.curtain),
+    wallpaper: normalizeControl(body.wallpaperName || body.wallpaper),
     wallColor: normalizeControl(overrides.wallColor || body.wallColor),
     furniture: normalizeControl(overrides.furniture || body.furnitureName || body.furniture),
+    fabric: normalizeControl(body.fabricName || body.fabric),
   };
 }
 
@@ -404,15 +419,6 @@ function perspectiveToCamera(perspective: string): string {
     return "wide-angle corner perspective capturing both wall depth and primary furniture arrangement";
   }
   return "human eye-level architectural interior perspective from an entrance-facing position";
-}
-
-function ceilingToDescription(ceiling: string): string {
-  const c = ceiling.toLowerCase();
-  if (c.includes("8")) return "standard 8-foot ceiling with a cozy proportion";
-  if (c.includes("9")) return "9-foot ceiling with balanced modern proportion";
-  if (c.includes("10")) return "10-foot ceiling with an airy spatial feel";
-  if (c.includes("12") || c.includes("high") || c.includes("tall")) return "12-foot high ceiling with a premium open feel";
-  return "ceiling height appropriate to the selected space";
 }
 
 function safeParseJson(rawText: string): Record<string, unknown> {
@@ -576,25 +582,132 @@ async function runVisibleElementAnalysis(params: {
   return sanitizeElements(result.elements);
 }
 
-async function runTileReferenceAnalysis(params: {
-  tileImageDataUrl: string;
-  tileName: string;
+function buildReferenceAssetAnalysisPrompt(params: {
+  assetType: ReferenceAssetKind;
+  assetName: string;
+}): string[] {
+  const shared = [
+    `Requested asset type: ${params.assetType}.`,
+    `Selected asset label: ${params.assetName}.`,
+    "First verify that the requested asset type is actually visible in the image.",
+    "If multiple candidate items are visible, choose the largest, most dominant, or most central matching item as the reference target.",
+  ];
+
+  if (params.assetType === "tile") {
+    return [
+      ...shared,
+      "Describe only the dominant tile/flooring reference.",
+      "Include: base color, vein/pattern style, finish feel, and overall tone.",
+    ];
+  }
+
+  if (params.assetType === "curtain") {
+    return [
+      ...shared,
+      "Describe only the dominant curtain or drape reference.",
+      "Include: fabric weight, opacity, pleat/header style, drape behavior, dominant colors, motif/pattern, and trim details.",
+    ];
+  }
+
+  if (params.assetType === "wallpaper") {
+    return [
+      ...shared,
+      "Describe only the dominant wallpaper reference.",
+      "Include: base color, motif/pattern type, repeat scale, finish feel, and visual density.",
+    ];
+  }
+
+  return [
+    ...shared,
+    "Describe only the dominant upholstery or textile fabric reference.",
+    "Include: weave/material feel, texture, dominant colors, motif/pattern, and whether it reads matte, rich, soft, or structured.",
+  ];
+}
+
+async function runReferenceAssetAnalysis(params: {
+  assetImageDataUrl: string;
+  assetName: string;
+  assetType: ReferenceAssetKind;
 }): Promise<string> {
   const result = await callVisionJson({
-    imageDataUrl: params.tileImageDataUrl,
+    imageDataUrl: params.assetImageDataUrl,
     temperature: 0.1,
     systemText:
-      "You analyze tile/material reference images for architectural rendering prompts. Return only JSON.",
+      "You analyze interior design reference images for rendering prompts. Return only JSON.",
     userText: [
-      `Tile selection label: ${params.tileName}`,
-      "Describe only visible tile properties in one concise sentence.",
-      "Include: base color, vein/pattern style, finish feel (matte/gloss/polished), and tone.",
+      ...buildReferenceAssetAnalysisPrompt({
+        assetType: params.assetType,
+        assetName: params.assetName,
+      }),
       "Return strict JSON:",
-      '{"tileDescriptor":"..."}',
+      '{"matched":true,"referenceDescriptor":"...","reason":"short reason if not matched"}',
+      "If the requested asset type is not clearly visible, set matched to false and keep referenceDescriptor empty.",
     ].join("\n"),
   });
 
-  return String(result.tileDescriptor || "").trim();
+  const matched = result.matched === true || String(result.matched || "").toLowerCase() === "true";
+  if (!matched) return "";
+  return String(result.referenceDescriptor || "").trim();
+}
+
+function sanitizeCustomAssets(customAssets: GenerateRequest["customAssets"]): Array<CustomAssetReference & { previewUrl: string }> {
+  if (!Array.isArray(customAssets)) return [];
+  return customAssets
+    .map((asset, index) => ({
+      ...asset,
+      id: String(asset?.id || `custom-${index + 1}`).trim(),
+      name: String(asset?.name || `Custom Asset ${index + 1}`).trim(),
+      prompt: String(asset?.prompt || "").trim(),
+      previewUrl: String(asset?.previewUrl || "").trim(),
+    }))
+    .filter((asset) => asset.previewUrl)
+    .slice(0, 4);
+}
+
+async function runCustomAssetAnalysis(params: {
+  imageDataUrl: string;
+  assetName: string;
+  userPrompt: string;
+}): Promise<string> {
+  const result = await callVisionJson({
+    imageDataUrl: params.imageDataUrl,
+    temperature: 0.1,
+    systemText:
+      "You analyze a custom interior design reference image and return only JSON.",
+    userText: [
+      `Asset name: ${params.assetName}.`,
+      params.userPrompt
+        ? `User instruction for this asset: ${params.userPrompt}`
+        : "No explicit user instruction was provided for this asset.",
+      "Describe the dominant visible subject, materials, colors, style cues, and likely use within an interior scene in one concise sentence.",
+      "Return strict JSON:",
+      '{"descriptor":"concise visual summary"}',
+    ].join("\n"),
+  });
+
+  return String(result.descriptor || "").trim();
+}
+
+function buildCustomAssetInstructionBlock(params: {
+  customAssets: Array<CustomAssetReference & { previewUrl: string }>;
+  analyzedDescriptors: Record<string, string>;
+}): string {
+  if (!params.customAssets.length) return "";
+
+  return [
+    "Custom uploaded asset references (highest priority after direct user prompt):",
+    ...params.customAssets.map((asset, index) => {
+      const parts = [`- Asset ${index + 1}: ${asset.name}.`];
+      if (asset.prompt) {
+        parts.push(`User instruction: ${polishPromptText(asset.prompt)}`);
+      }
+      if (params.analyzedDescriptors[asset.id]) {
+        parts.push(`Visual reference summary: ${params.analyzedDescriptors[asset.id]}.`);
+      }
+      parts.push("Use this as style/material/furniture/decor guidance only unless the user explicitly asks to change room structure.");
+      return parts.join(" ");
+    }),
+  ].join("\n");
 }
 
 function detectContinuationChange(params: {
@@ -629,6 +742,18 @@ function detectContinuationChange(params: {
     }
   }
 
+  const currentCurtain = normalizeControl(body.curtain);
+  const initialCurtain = normalizeControl(initialConfig.curtainStyle === "auto" ? "none" : initialConfig.curtainStyle);
+  if (currentCurtain !== initialCurtain) {
+    changes.push(`curtain treatment -> ${normalizeControl(body.curtainName || body.curtain)}`);
+  }
+
+  const currentWallpaper = normalizeControl(body.wallpaper);
+  const initialWallpaper = normalizeControl(initialConfig.wallpaperStyle === "auto" ? "none" : initialConfig.wallpaperStyle);
+  if (currentWallpaper !== initialWallpaper) {
+    changes.push(`wallpaper -> ${normalizeControl(body.wallpaperName || body.wallpaper)}`);
+  }
+
   if (overrides.wallColor) {
     changes.push(`paint color -> ${controls.wallColor}`);
   } else {
@@ -649,6 +774,12 @@ function detectContinuationChange(params: {
     }
   }
 
+  const currentFabric = normalizeControl(body.fabric);
+  const initialFabric = normalizeControl(initialConfig.fabricStyle === "auto" ? "none" : initialConfig.fabricStyle);
+  if (currentFabric !== initialFabric) {
+    changes.push(`fabric/upholstery -> ${normalizeControl(body.fabricName || body.fabric)}`);
+  }
+
   if (overrides.perspective) {
     changes.push(`camera perspective -> ${controls.perspective}`);
   }
@@ -667,7 +798,7 @@ function detectContinuationChange(params: {
 
   return hasCustomInstruction
     ? "No base parameter diff detected. Apply Additional user instruction while preserving room geometry/camera lock unless explicitly requested."
-    : "No clear tile/paint/furniture diff detected; preserve geometry and camera and only apply explicit user edit text.";
+    : "No clear tile/curtain/wallpaper/paint/furniture/fabric diff detected; preserve geometry and camera and only apply explicit user edit text.";
 }
 
 function buildGenerationPrompt(params: {
@@ -678,21 +809,30 @@ function buildGenerationPrompt(params: {
   userPrompt: string;
   overridesSummary: string;
   floorPlanAnalysis: string;
-  tileReferenceDescriptor: string;
+  referenceDescriptors: ReferenceAssetDescriptors;
+  customAssetBlock: string;
 }): string {
   const cameraDescription = perspectiveToCamera(normalizeControl(params.controls.perspective));
-  const ceilingDescription = ceilingToDescription(normalizeControl(params.controls.ceilingHeight));
   const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
   const wallColorHardConstraintLine = buildWallColorHardConstraintLine(params.controls.wallColor);
 
   const materialsBlock = [
     `- Tile/flooring: ${normalizeControl(params.controls.tile)}`,
-    params.tileReferenceDescriptor ? `- Tile reference details: ${params.tileReferenceDescriptor}` : "",
+    params.referenceDescriptors.tile ? `- Tile reference details: ${params.referenceDescriptors.tile}` : "",
     "- Tile placement policy: if tile/flooring is specified, apply it only on floor surfaces.",
     "- Tile size policy: if tile/flooring is specified, render as uniform 4x4 square tiles with realistic grout joints.",
+    `- Curtains/window treatment: ${normalizeControl(params.controls.curtain)}`,
+    params.referenceDescriptors.curtain ? `- Curtain reference details: ${params.referenceDescriptors.curtain}` : "",
+    "- Curtain placement policy: if curtains are specified, place them only on logical window/opening treatments with realistic length and fullness.",
+    `- Wallpaper: ${normalizeControl(params.controls.wallpaper)}`,
+    params.referenceDescriptors.wallpaper ? `- Wallpaper reference details: ${params.referenceDescriptors.wallpaper}` : "",
+    "- Wallpaper placement policy: if wallpaper is specified, apply it only to wall surfaces and keep remaining visible painted walls aligned with the selected wall color.",
     `- Paint color: ${normalizeControl(params.controls.wallColor)}`,
     `- ${wallColorPolicyLine}`,
     `- Furniture style: ${normalizeControl(params.controls.furniture)}`,
+    `- Fabric/upholstery: ${normalizeControl(params.controls.fabric)}`,
+    params.referenceDescriptors.fabric ? `- Fabric reference details: ${params.referenceDescriptors.fabric}` : "",
+    "- Fabric application policy: if fabric is specified, apply it only to upholstery and soft furnishings that naturally belong to the room type.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -703,6 +843,10 @@ function buildGenerationPrompt(params: {
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
+    "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery.",
+    "- If wallpaper is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
+    "- If fabric is specified, apply it only to upholstery or soft furnishings and never to walls, floors, cabinetry, or curtains unless explicitly requested.",
+    "- Treat uploaded custom assets only as style/material/furniture/decor references unless the user explicitly requests structural change.",
     wallColorHardConstraintLine,
     "- Do not render as a diagram or sketch or floor plan view.",
     "- Do not hallucinate any elements.",
@@ -720,12 +864,12 @@ function buildGenerationPrompt(params: {
     `Lighting: ${params.snippet.lighting}`,
     `Camera template guidance: ${params.snippet.camera}`,
     `Camera and perspective: ${cameraDescription}.`,
-    `Ceiling guidance: ${ceilingDescription}.`,
     `Realism rules: ${params.snippet.realismRules}`,
     "Decor accent: optionally add at most one subtle framed wall painting/artwork if it naturally fits the room type; otherwise keep walls clean.",
     params.overridesSummary
       ? `Custom prompt structured overrides (highest priority):\n${params.overridesSummary}`
       : "",
+    params.customAssetBlock,
     params.floorPlanAnalysis ? `Structural reference from floor plan analysis: ${params.floorPlanAnalysis}` : "",
     params.userPrompt ? `Additional user instruction: ${params.userPrompt}` : "",
     "Hard constraints:",
@@ -744,7 +888,8 @@ function buildContinuationPrompt(params: {
   userPrompt: string;
   changeInstruction: string;
   overridesSummary: string;
-  tileReferenceDescriptor: string;
+  referenceDescriptors: ReferenceAssetDescriptors;
+  customAssetBlock: string;
 }): string {
   const hasCustomInstruction = Boolean(String(params.userPrompt || "").trim());
   const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
@@ -763,6 +908,10 @@ function buildContinuationPrompt(params: {
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
+    "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery.",
+    "- If wallpaper is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
+    "- If fabric is specified, apply it only to upholstery or soft furnishings and never to walls, floors, cabinetry, or curtains unless explicitly requested.",
+    "- Treat uploaded custom assets only as style/material/furniture/decor references unless the user explicitly requests structural change.",
     wallColorHardConstraintLine,
     hasCustomInstruction
       ? "- Keep walls, openings, and structural proportions fixed. Object-level additions/styling are allowed only if requested above."
@@ -778,7 +927,10 @@ function buildContinuationPrompt(params: {
     `Composition baseline: ${params.snippet.composition}`,
     "EDIT / CONTINUATION MODE:",
     params.changeInstruction,
-    params.tileReferenceDescriptor ? `Tile reference details: ${params.tileReferenceDescriptor}` : "",
+    params.referenceDescriptors.tile ? `Tile reference details: ${params.referenceDescriptors.tile}` : "",
+    params.referenceDescriptors.curtain ? `Curtain reference details: ${params.referenceDescriptors.curtain}` : "",
+    params.referenceDescriptors.wallpaper ? `Wallpaper reference details: ${params.referenceDescriptors.wallpaper}` : "",
+    params.referenceDescriptors.fabric ? `Fabric reference details: ${params.referenceDescriptors.fabric}` : "",
     wallColorPolicyLine,
     `Camera template guidance: ${params.snippet.camera}`,
     params.allowPerspectiveChange
@@ -788,6 +940,7 @@ function buildContinuationPrompt(params: {
     params.overridesSummary
       ? `Custom prompt structured overrides (highest priority):\n${params.overridesSummary}`
       : "",
+    params.customAssetBlock,
     params.userPrompt ? `Additional user instruction: ${params.userPrompt}` : "",
     "Hard constraints:",
     hardConstraints,
@@ -813,27 +966,90 @@ export async function buildPromptAndContext(
   const { userPrompt: cleanedUserPrompt, overrides } = extractCustomPromptAndOverrides(body.prompt);
   const userPrompt = polishPromptText(cleanedUserPrompt);
   const controls = resolveEffectiveControls(body, overrides);
-  const hasTileReference =
-    Boolean(body.tileImage) &&
-    !["none", "auto"].includes(normalizeControl(body.tile)) &&
-    !Boolean(overrides.tile);
-  let tileReferenceDescriptor = "";
+  const referenceDescriptors: ReferenceAssetDescriptors = {
+    tile: "",
+    curtain: "",
+    wallpaper: "",
+    fabric: "",
+  };
+  const customAssets = sanitizeCustomAssets(body.customAssets);
+  const analyzedCustomAssetDescriptors: Record<string, string> = {};
   const overridesSummary = buildOverridesSummary(overrides, controls);
 
-  if (hasTileReference && typeof body.tileImage === "string") {
+  const referenceAssets: Array<{
+    kind: ReferenceAssetKind;
+    imageDataUrl: string | undefined;
+    selectedValue: string;
+    selectedName: string;
+    skipBecauseOverride?: boolean;
+  }> = [
+    {
+      kind: "tile",
+      imageDataUrl: body.tileImage,
+      selectedValue: normalizeControl(body.tile),
+      selectedName: normalizeControl(controls.tile),
+      skipBecauseOverride: Boolean(overrides.tile),
+    },
+    {
+      kind: "curtain",
+      imageDataUrl: body.curtainImage,
+      selectedValue: normalizeControl(body.curtain),
+      selectedName: normalizeControl(controls.curtain),
+    },
+    {
+      kind: "wallpaper",
+      imageDataUrl: body.wallpaperImage,
+      selectedValue: normalizeControl(body.wallpaper),
+      selectedName: normalizeControl(controls.wallpaper),
+    },
+    {
+      kind: "fabric",
+      imageDataUrl: body.fabricImage,
+      selectedValue: normalizeControl(body.fabric),
+      selectedName: normalizeControl(controls.fabric),
+    },
+  ];
+
+  for (const asset of referenceAssets) {
+    if (!asset.imageDataUrl || ["none", "auto"].includes(asset.selectedValue) || asset.skipBecauseOverride) {
+      continue;
+    }
+
     try {
-      tileReferenceDescriptor = await runTileReferenceAnalysis({
-        tileImageDataUrl: body.tileImage,
-        tileName: normalizeControl(controls.tile),
+      referenceDescriptors[asset.kind] = await runReferenceAssetAnalysis({
+        assetImageDataUrl: asset.imageDataUrl,
+        assetName: asset.selectedName,
+        assetType: asset.kind,
       });
     } catch (error) {
-      console.warn("[Prompt Builder] Tile reference analysis failed. Continuing without tile descriptor.", {
-        tile: normalizeControl(controls.tile),
+      console.warn(`[Prompt Builder] ${asset.kind} reference analysis failed. Continuing without descriptor.`, {
+        selectedName: asset.selectedName,
         error: error instanceof Error ? error.message : String(error),
       });
-      tileReferenceDescriptor = "";
+      referenceDescriptors[asset.kind] = "";
     }
   }
+
+  for (const asset of customAssets) {
+    try {
+      analyzedCustomAssetDescriptors[asset.id] = await runCustomAssetAnalysis({
+        imageDataUrl: asset.previewUrl,
+        assetName: asset.name,
+        userPrompt: asset.prompt,
+      });
+    } catch (error) {
+      console.warn("[Prompt Builder] Custom asset analysis failed. Continuing without descriptor.", {
+        assetName: asset.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      analyzedCustomAssetDescriptors[asset.id] = "";
+    }
+  }
+
+  const customAssetBlock = buildCustomAssetInstructionBlock({
+    customAssets,
+    analyzedDescriptors: analyzedCustomAssetDescriptors,
+  });
 
   let prompt: string;
 
@@ -845,7 +1061,8 @@ export async function buildPromptAndContext(
       userPrompt,
       changeInstruction: detectContinuationChange({ body, controls, overrides, userPrompt }),
       overridesSummary,
-      tileReferenceDescriptor,
+      referenceDescriptors,
+      customAssetBlock,
     });
   } else {
     if (!body.image) {
@@ -875,7 +1092,8 @@ export async function buildPromptAndContext(
       userPrompt,
       overridesSummary,
       floorPlanAnalysis,
-      tileReferenceDescriptor,
+      referenceDescriptors,
+      customAssetBlock,
     });
   }
 
