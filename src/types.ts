@@ -1,9 +1,19 @@
-﻿export type PlanTier = "basic" | "plus" | "pro";
+export type PlanTier = "basic" | "plus" | "pro";
+
+export type CustomAssetUseAs =
+  | "auto"
+  | "floor_tile"
+  | "wall_finish"
+  | "curtain"
+  | "fabric"
+  | "furniture"
+  | "decor";
 
 export interface CustomAssetReference {
   id: string;
   name: string;
   prompt: string;
+  useAs?: CustomAssetUseAs;
   r2Key: string;
   previewUrl?: string;
   mimeType?: string;
@@ -37,6 +47,7 @@ export interface GenerateRequest {
   session?: {
     sessionId: string;
     floorPlanHash?: string | null;
+    detectedCategory?: string | null;
     previousRenderedImages?: string[];
     latestRenderedImage?: string | null;
     firstRenderedImage?: string | null;
@@ -62,4 +73,3 @@ export function normalizePlanTier(value: GenerateRequest["planTier"]): PlanTier 
   }
   return "plus";
 }
-

@@ -3,6 +3,7 @@
 export type PromptBuildResult = {
   prompt: string;
   isBathroomCategory: boolean;
+  resolvedCategoryLabel: string;
   previousRenderedImages: string[];
   latestRenderedImage: string | null;
 };
@@ -50,12 +51,46 @@ type EffectivePromptControls = {
   fabric: string;
 };
 
-type ReferenceAssetKind = "tile" | "curtain" | "wallpaper" | "fabric";
+type CustomAssetUseAs = NonNullable<CustomAssetReference["useAs"]> | "auto";
+
+type SanitizedCustomAsset = CustomAssetReference & {
+  previewUrl: string;
+  useAs: CustomAssetUseAs;
+};
+
+type TargetedCustomAssetOverride = {
+  asset: SanitizedCustomAsset;
+  descriptor: string;
+  instruction: string;
+};
+
+type CustomAssetResolution = {
+  floorTile: TargetedCustomAssetOverride | null;
+  wallFinish: TargetedCustomAssetOverride | null;
+  curtain: TargetedCustomAssetOverride | null;
+  fabric: TargetedCustomAssetOverride | null;
+  furniture: TargetedCustomAssetOverride | null;
+  genericAssets: TargetedCustomAssetOverride[];
+};
+
+type CurtainApplicability = {
+  allowCurtain: boolean;
+  reason: string;
+};
+
+type BathroomWindowPolicy = {
+  allowWindow: boolean;
+  reason: string;
+  source: "plan" | "user" | "default";
+};
+
+type ReferenceAssetKind = "tile" | "curtain" | "wallpaper" | "furniture" | "fabric";
 
 type ReferenceAssetDescriptors = {
   tile: string;
   curtain: string;
   wallpaper: string;
+  furniture: string;
   fabric: string;
 };
 
@@ -64,6 +99,11 @@ type CustomAssetReference = NonNullable<GenerateRequest["customAssets"]>[number]
 type SynonymEntry = {
   canonical: string;
   phrases: string[];
+};
+
+type CategoryDetectionResult = {
+  categoryKey: CategoryKey;
+  label: string;
 };
 
 const CATEGORY_SNIPPETS: Record<CategoryKey, CategorySnippet> = {
@@ -266,11 +306,40 @@ const FURNITURE_SYNONYMS: SynonymEntry[] = [
   { canonical: "None", phrases: ["no furniture", "without furniture", "empty room furniture"] },
 ];
 
+const CUSTOM_ASSET_USE_AS_VALUES = new Set<CustomAssetUseAs>([
+  "auto",
+  "floor_tile",
+  "wall_finish",
+  "curtain",
+  "fabric",
+  "furniture",
+  "decor",
+]);
+
+const CUSTOM_ASSET_USE_AS_LABELS: Record<CustomAssetUseAs, string> = {
+  auto: "general uploaded reference",
+  floor_tile: "uploaded floor tile reference",
+  wall_finish: "uploaded wall finish reference",
+  curtain: "uploaded curtain reference",
+  fabric: "uploaded fabric reference",
+  furniture: "uploaded furniture reference",
+  decor: "uploaded decor reference",
+};
+
 function normalizeControl(value: unknown): string {
   if (value === null || value === undefined || value === "") return "auto";
   const text = String(value).trim();
   if (!text) return "auto";
   return text.toLowerCase() === "none" ? "auto" : text;
+}
+
+function normalizeCustomAssetUseAs(value: unknown): CustomAssetUseAs {
+  const normalized = String(value || "auto").trim().toLowerCase().replace(/\s+/g, "_") as CustomAssetUseAs;
+  return CUSTOM_ASSET_USE_AS_VALUES.has(normalized) ? normalized : "auto";
+}
+
+function customAssetUseAsToControlValue(useAs: CustomAssetUseAs, assetName: string): string {
+  return `${CUSTOM_ASSET_USE_AS_LABELS[useAs]} (${assetName})`;
 }
 
 function buildWallColorPolicyLine(wallColor: string): string {
@@ -290,6 +359,100 @@ function buildWallColorHardConstraintLine(wallColor: string): string {
     return "- Keep all walls as painted surfaces (no wall tiles/cladding). Pick one harmonious wall paint color and keep it consistent.";
   }
   return `- Keep all walls as painted surfaces (no wall tiles/cladding). Wall paint color must stay faithful to: ${normalized}.`;
+}
+
+function buildBathroomWallTilePolicyLine(params: {
+  wallColor: string;
+  floorTile: string;
+}): string {
+  const normalizedWall = normalizeControl(params.wallColor);
+  const normalizedFloorTile = normalizeControl(params.floorTile);
+  const tileDirection = normalizedFloorTile === "auto"
+    ? "Bathroom wall rule: use coordinated bathroom wall tiles/cladding on the main wet-zone walls and vanity/shower/tub surrounds, choosing a finish that harmonizes with the floor and the bathroom palette."
+    : `Bathroom wall rule: use coordinated bathroom wall tiles/cladding on the main wet-zone walls and vanity/shower/tub surrounds, matching the selected floor-tile family (${normalizedFloorTile}) without making every wall an exact floor copy.`;
+
+  const remainingWallNote = normalizedWall === "auto"
+    ? "If any small dry wall areas remain painted, use one harmonious paint tone only on those remaining painted areas."
+    : /^#[0-9A-Fa-f]{3,8}$/.test(normalizedWall)
+      ? `If any small dry wall areas remain painted, keep those painted areas faithful to ${normalizedWall}.`
+      : `If any small dry wall areas remain painted, keep those painted areas faithful to "${normalizedWall}".`;
+
+  return `${tileDirection} ${remainingWallNote}`;
+}
+
+function buildBathroomWallTileHardConstraintLines(params: {
+  wallColor: string;
+  floorTile: string;
+}): string[] {
+  const normalizedWall = normalizeControl(params.wallColor);
+  const normalizedFloorTile = normalizeControl(params.floorTile);
+
+  return [
+    normalizedFloorTile === "auto"
+      ? "- In bathrooms, include realistic wall tiles/cladding on the main wet-zone walls or vanity/shower/tub surrounds; do not leave the whole bathroom as plain painted drywall unless explicitly requested."
+      : `- In bathrooms, include coordinated wall tiles/cladding on the main wet-zone walls or vanity/shower/tub surrounds, matching the selected floor-tile family (${normalizedFloorTile}). Do not leave the whole bathroom as plain painted drywall unless explicitly requested.`,
+    normalizedWall === "auto"
+      ? "- If small dry wall areas remain uncovered, use one harmonious painted wall tone only on those remaining painted areas."
+      : `- If small dry wall areas remain uncovered, keep those painted wall areas faithful to: ${normalizedWall}.`,
+  ];
+}
+
+function buildWallSurfacePolicyLine(params: {
+  wallColor: string;
+  wallFinishOverride: TargetedCustomAssetOverride | null;
+  isBathroom: boolean;
+  floorTile: string;
+}): string {
+  if (!params.wallFinishOverride && params.isBathroom) {
+    return buildBathroomWallTilePolicyLine({
+      wallColor: params.wallColor,
+      floorTile: params.floorTile,
+    });
+  }
+
+  if (!params.wallFinishOverride) {
+    return buildWallColorPolicyLine(params.wallColor);
+  }
+
+  const normalized = normalizeControl(params.wallColor);
+  const remainingWallNote = normalized === "auto"
+    ? "If any small wall areas remain uncovered, use one harmonious paint tone only on those remaining painted areas."
+    : /^#[0-9A-Fa-f]{3,8}$/.test(normalized)
+      ? `If any wall areas remain uncovered, keep those painted areas faithful to ${normalized}.`
+      : `If any wall areas remain uncovered, keep those painted areas faithful to "${normalized}".`;
+
+  return params.isBathroom
+    ? `Primary wall finish rule: use ${customAssetUseAsToControlValue("wall_finish", params.wallFinishOverride.asset.name)} as the main bathroom wall tile/cladding treatment on the wall surfaces. ${remainingWallNote}`
+    : `Primary wall finish rule: use ${customAssetUseAsToControlValue("wall_finish", params.wallFinishOverride.asset.name)} as the main wall-surface treatment. ${remainingWallNote}`;
+}
+
+function buildWallSurfaceHardConstraintLines(params: {
+  wallColor: string;
+  wallFinishOverride: TargetedCustomAssetOverride | null;
+  isBathroom: boolean;
+  floorTile: string;
+}): string[] {
+  if (!params.wallFinishOverride && params.isBathroom) {
+    return buildBathroomWallTileHardConstraintLines({
+      wallColor: params.wallColor,
+      floorTile: params.floorTile,
+    });
+  }
+
+  if (!params.wallFinishOverride) {
+    return [buildWallColorHardConstraintLine(params.wallColor)];
+  }
+
+  const normalized = normalizeControl(params.wallColor);
+  return [
+    params.isBathroom
+      ? `- Use ${customAssetUseAsToControlValue("wall_finish", params.wallFinishOverride.asset.name)} as the highest-priority bathroom wall tile/cladding reference.`
+      : `- Use ${customAssetUseAsToControlValue("wall_finish", params.wallFinishOverride.asset.name)} as the highest-priority wall-surface reference.`,
+    "- Apply the uploaded wall finish only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
+    normalized === "auto"
+      ? "- If wall areas remain uncovered, use one harmonious painted wall tone only on those remaining painted areas."
+      : `- If wall areas remain uncovered, keep those painted wall areas faithful to: ${normalized}.`,
+  ];
 }
 
 function normalizePromptForMatching(value: string): string {
@@ -361,15 +524,29 @@ function extractCustomPromptAndOverrides(rawPrompt: string | undefined): {
   };
 }
 
-function resolveEffectiveControls(body: GenerateRequest, overrides: CustomPromptOverrides): EffectivePromptControls {
+function resolveEffectiveControls(
+  body: GenerateRequest,
+  overrides: CustomPromptOverrides,
+  customAssetResolution: CustomAssetResolution
+): EffectivePromptControls {
   return {
     perspective: normalizeControl(overrides.perspective || body.perspective),
-    tile: normalizeControl(overrides.tile || body.tileName || body.tile),
-    curtain: normalizeControl(body.curtainName || body.curtain),
-    wallpaper: normalizeControl(body.wallpaperName || body.wallpaper),
+    tile: customAssetResolution.floorTile
+      ? customAssetUseAsToControlValue("floor_tile", customAssetResolution.floorTile.asset.name)
+      : normalizeControl(overrides.tile || body.tileName || body.tile),
+    curtain: customAssetResolution.curtain
+      ? customAssetUseAsToControlValue("curtain", customAssetResolution.curtain.asset.name)
+      : normalizeControl(body.curtainName || body.curtain),
+    wallpaper: customAssetResolution.wallFinish
+      ? customAssetUseAsToControlValue("wall_finish", customAssetResolution.wallFinish.asset.name)
+      : normalizeControl(body.wallpaperName || body.wallpaper),
     wallColor: normalizeControl(overrides.wallColor || body.wallColor),
-    furniture: normalizeControl(overrides.furniture || body.furnitureName || body.furniture),
-    fabric: normalizeControl(body.fabricName || body.fabric),
+    furniture: customAssetResolution.furniture
+      ? customAssetUseAsToControlValue("furniture", customAssetResolution.furniture.asset.name)
+      : normalizeControl(overrides.furniture || body.furnitureName || body.furniture),
+    fabric: customAssetResolution.fabric
+      ? customAssetUseAsToControlValue("fabric", customAssetResolution.fabric.asset.name)
+      : normalizeControl(body.fabricName || body.fabric),
   };
 }
 
@@ -395,10 +572,57 @@ function normalizeCategoryKey(value: string): CategoryKey {
   return "living";
 }
 
+function isAutoCategorySelection(value: string): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "" || normalized === "auto" || normalized === "auto detect" || normalized === "auto-detect";
+}
+
+async function runAutoCategoryDetection(params: {
+  imageDataUrl: string;
+}): Promise<CategoryDetectionResult> {
+  const result = await callVisionJson({
+    imageDataUrl: params.imageDataUrl,
+    temperature: 0,
+    systemText:
+      "You identify the most likely room category from a floor plan image. Return only JSON.",
+    userText: [
+      "Choose the single best matching category from this exact list:",
+      "bathroom, kitchen, bedroom, living, office_workroom, office_meeting, office_reception, dining.",
+      "Judge only from visible floor-plan symbols, furniture layout, labels, and architectural cues.",
+      "Return strict JSON:",
+      '{"categoryKey":"bathroom|kitchen|bedroom|living|office_workroom|office_meeting|office_reception|dining","reason":"short reason"}',
+    ].join("\n"),
+  });
+
+  const rawKey = String(result.categoryKey || "").trim();
+  const categoryKey = normalizeCategoryKey(rawKey || "living");
+  return {
+    categoryKey,
+    label: CATEGORY_SNIPPETS[categoryKey].label,
+  };
+}
+
 function polishPromptText(value: string | undefined): string {
   const cleaned = String(value || "").replace(/\s+/g, " ").trim();
   if (!cleaned) return "";
   return /[.!?]$/.test(cleaned) ? cleaned : `${cleaned}.`;
+}
+
+function detectBathroomWindowPreference(userPrompt: string): "allow" | "disallow" | "unspecified" {
+  const prompt = String(userPrompt || "").toLowerCase();
+  if (!prompt.trim()) return "unspecified";
+
+  const windowTerms = "(window|windows|skylight|ventilator|ventilation window)";
+  const negativePattern = new RegExp(`(?:no|without|avoid|remove|dont add|don't add|do not add|skip)(?:[^.]{0,25})${windowTerms}`);
+  if (negativePattern.test(prompt) || /\bwindowless\b/.test(prompt)) {
+    return "disallow";
+  }
+
+  if (new RegExp(windowTerms).test(prompt)) {
+    return "allow";
+  }
+
+  return "unspecified";
 }
 
 function perspectiveToCamera(perspective: string): string {
@@ -582,6 +806,54 @@ async function runVisibleElementAnalysis(params: {
   return sanitizeElements(result.elements);
 }
 
+async function runCurtainApplicabilityAnalysis(params: {
+  imageDataUrl: string;
+  selectedCategoryLabel: string;
+}): Promise<CurtainApplicability> {
+  const result = await callVisionJson({
+    imageDataUrl: params.imageDataUrl,
+    temperature: 0,
+    systemText:
+      "You are a strict architectural symbol validator. Determine whether a real window or opening suitable for curtains is clearly visible in the floor plan. Return only JSON.",
+    userText: [
+      `Category context: ${params.selectedCategoryLabel}.`,
+      "Return strict JSON:",
+      '{"allowCurtain":true,"reason":"short reason"}',
+      "Set allowCurtain to true only if a real window/opening suitable for curtains is clearly visible.",
+      "Bathrooms should default to false unless a clear window/opening is visible.",
+      "Never confuse door leaves, door-swing arcs, entry symbols, or generic doors with curtains or drapes.",
+    ].join("\n"),
+  });
+
+  const allowCurtain = result.allowCurtain === true || String(result.allowCurtain || "").toLowerCase() === "true";
+  const reason = String(result.reason || "No clear curtain-suitable window/opening was visible in the floor plan.").trim();
+  return { allowCurtain, reason };
+}
+
+async function runBathroomWindowApplicabilityAnalysis(params: {
+  imageDataUrl: string;
+  selectedCategoryLabel: string;
+}): Promise<{ allowWindow: boolean; reason: string }> {
+  const result = await callVisionJson({
+    imageDataUrl: params.imageDataUrl,
+    temperature: 0,
+    systemText:
+      "You are a strict architectural symbol validator. Determine whether a real bathroom window or exterior opening is clearly visible in the floor plan. Return only JSON.",
+    userText: [
+      `Category context: ${params.selectedCategoryLabel}.`,
+      "Return strict JSON:",
+      '{"allowWindow":true,"reason":"short reason"}',
+      "Set allowWindow to true only if a real bathroom window or exterior opening is clearly visible in the floor plan.",
+      "Bathrooms should default to false unless a clear window/opening symbol is visible.",
+      "Never infer a window from empty wall space, cropped edges, thin wall gaps, door leaves, door-swing arcs, sanitary fixtures, or generic openings.",
+    ].join("\n"),
+  });
+
+  const allowWindow = result.allowWindow === true || String(result.allowWindow || "").toLowerCase() === "true";
+  const reason = String(result.reason || "No clear bathroom window/opening was visible in the floor plan.").trim();
+  return { allowWindow, reason };
+}
+
 function buildReferenceAssetAnalysisPrompt(params: {
   assetType: ReferenceAssetKind;
   assetName: string;
@@ -614,6 +886,14 @@ function buildReferenceAssetAnalysisPrompt(params: {
       ...shared,
       "Describe only the dominant wallpaper reference.",
       "Include: base color, motif/pattern type, repeat scale, finish feel, and visual density.",
+    ];
+  }
+
+  if (params.assetType === "furniture") {
+    return [
+      ...shared,
+      "Describe only the dominant furniture reference.",
+      "Include: furniture type, silhouette/form language, main material or finish, upholstery feel if visible, dominant colors, and whether it reads modern, classic, minimal, sculptural, or luxurious.",
     ];
   }
 
@@ -650,7 +930,7 @@ async function runReferenceAssetAnalysis(params: {
   return String(result.referenceDescriptor || "").trim();
 }
 
-function sanitizeCustomAssets(customAssets: GenerateRequest["customAssets"]): Array<CustomAssetReference & { previewUrl: string }> {
+function sanitizeCustomAssets(customAssets: GenerateRequest["customAssets"]): SanitizedCustomAsset[] {
   if (!Array.isArray(customAssets)) return [];
   return customAssets
     .map((asset, index) => ({
@@ -658,6 +938,7 @@ function sanitizeCustomAssets(customAssets: GenerateRequest["customAssets"]): Ar
       id: String(asset?.id || `custom-${index + 1}`).trim(),
       name: String(asset?.name || `Custom Asset ${index + 1}`).trim(),
       prompt: String(asset?.prompt || "").trim(),
+      useAs: normalizeCustomAssetUseAs(asset?.useAs),
       previewUrl: String(asset?.previewUrl || "").trim(),
     }))
     .filter((asset) => asset.previewUrl)
@@ -668,6 +949,7 @@ async function runCustomAssetAnalysis(params: {
   imageDataUrl: string;
   assetName: string;
   userPrompt: string;
+  useAs: CustomAssetUseAs;
 }): Promise<string> {
   const result = await callVisionJson({
     imageDataUrl: params.imageDataUrl,
@@ -676,10 +958,11 @@ async function runCustomAssetAnalysis(params: {
       "You analyze a custom interior design reference image and return only JSON.",
     userText: [
       `Asset name: ${params.assetName}.`,
+      `Intended usage target: ${CUSTOM_ASSET_USE_AS_LABELS[params.useAs]}.`,
       params.userPrompt
         ? `User instruction for this asset: ${params.userPrompt}`
         : "No explicit user instruction was provided for this asset.",
-      "Describe the dominant visible subject, materials, colors, style cues, and likely use within an interior scene in one concise sentence.",
+      "Describe the dominant visible subject, materials, colors, style cues, and the most relevant interior use for that target in one concise sentence.",
       "Return strict JSON:",
       '{"descriptor":"concise visual summary"}',
     ].join("\n"),
@@ -688,26 +971,107 @@ async function runCustomAssetAnalysis(params: {
   return String(result.descriptor || "").trim();
 }
 
-function buildCustomAssetInstructionBlock(params: {
-  customAssets: Array<CustomAssetReference & { previewUrl: string }>;
-  analyzedDescriptors: Record<string, string>;
-}): string {
-  if (!params.customAssets.length) return "";
+function buildTargetedCustomAssetOverride(asset: SanitizedCustomAsset, descriptor: string): TargetedCustomAssetOverride {
+  return {
+    asset,
+    descriptor: String(descriptor || "").trim(),
+    instruction: polishPromptText(asset.prompt),
+  };
+}
 
-  return [
-    "Custom uploaded asset references (highest priority after direct user prompt):",
-    ...params.customAssets.map((asset, index) => {
-      const parts = [`- Asset ${index + 1}: ${asset.name}.`];
-      if (asset.prompt) {
-        parts.push(`User instruction: ${polishPromptText(asset.prompt)}`);
-      }
-      if (params.analyzedDescriptors[asset.id]) {
-        parts.push(`Visual reference summary: ${params.analyzedDescriptors[asset.id]}.`);
-      }
-      parts.push("Use this as style/material/furniture/decor guidance only unless the user explicitly asks to change room structure.");
-      return parts.join(" ");
-    }),
-  ].join("\n");
+function resolveCustomAssetOverrides(params: {
+  customAssets: SanitizedCustomAsset[];
+  analyzedDescriptors: Record<string, string>;
+}): CustomAssetResolution {
+  const resolution: CustomAssetResolution = {
+    floorTile: null,
+    wallFinish: null,
+    curtain: null,
+    fabric: null,
+    furniture: null,
+    genericAssets: [],
+  };
+
+  for (const asset of params.customAssets) {
+    const override = buildTargetedCustomAssetOverride(asset, params.analyzedDescriptors[asset.id] || "");
+    switch (asset.useAs) {
+      case "floor_tile":
+        if (!resolution.floorTile) resolution.floorTile = override;
+        else resolution.genericAssets.push(override);
+        break;
+      case "wall_finish":
+        if (!resolution.wallFinish) resolution.wallFinish = override;
+        else resolution.genericAssets.push(override);
+        break;
+      case "curtain":
+        if (!resolution.curtain) resolution.curtain = override;
+        else resolution.genericAssets.push(override);
+        break;
+      case "fabric":
+        if (!resolution.fabric) resolution.fabric = override;
+        else resolution.genericAssets.push(override);
+        break;
+      case "furniture":
+        if (!resolution.furniture) resolution.furniture = override;
+        else resolution.genericAssets.push(override);
+        break;
+      default:
+        resolution.genericAssets.push(override);
+        break;
+    }
+  }
+
+  return resolution;
+}
+
+function buildCustomAssetInstructionBlock(params: {
+  resolution: CustomAssetResolution;
+}): string {
+  const blocks: string[] = [];
+
+  const targetedLines: string[] = [];
+  const addTargetedLine = (
+    override: TargetedCustomAssetOverride | null,
+    label: string,
+    replacementNote: string
+  ) => {
+    if (!override) return;
+    const parts = [
+      `- ${label}: use ${CUSTOM_ASSET_USE_AS_LABELS[override.asset.useAs]} "${override.asset.name}" as the highest-priority reference.`,
+      replacementNote,
+      override.instruction ? `User instruction: ${override.instruction}` : "",
+      override.descriptor ? `Visual reference summary: ${override.descriptor}.` : "",
+    ].filter(Boolean);
+    targetedLines.push(parts.join(" "));
+  };
+
+  addTargetedLine(params.resolution.floorTile, "Floor tile override", "Ignore any conflicting default floor-tile selection.");
+  addTargetedLine(params.resolution.wallFinish, "Wall finish override", "Ignore any conflicting default wallpaper/wall-finish choice on those treated wall surfaces.");
+  addTargetedLine(params.resolution.curtain, "Curtain override", "Ignore any conflicting default curtain choice if this override is allowed by the floor plan.");
+  addTargetedLine(params.resolution.fabric, "Fabric override", "Ignore any conflicting default fabric/upholstery selection for the same upholstered surfaces.");
+  addTargetedLine(params.resolution.furniture, "Furniture override", "Use this as the main furniture style/reference for the room instead of conflicting default furniture styling.");
+
+  if (targetedLines.length) {
+    blocks.push([
+      "Targeted uploaded custom asset overrides (highest priority for their matched slot):",
+      ...targetedLines,
+    ].join("\n"));
+  }
+
+  if (params.resolution.genericAssets.length) {
+    blocks.push([
+      "Additional uploaded custom asset references:",
+      ...params.resolution.genericAssets.map((override, index) => {
+        const parts = [`- Asset ${index + 1}: ${override.asset.name}.`];
+        if (override.instruction) parts.push(`User instruction: ${override.instruction}`);
+        if (override.descriptor) parts.push(`Visual reference summary: ${override.descriptor}.`);
+        parts.push("Use this as supporting style/material/decor guidance only unless the user explicitly requests structural change.");
+        return parts.join(" ");
+      }),
+    ].join("\n"));
+  }
+
+  return blocks.join("\n\n");
 }
 
 function detectContinuationChange(params: {
@@ -715,11 +1079,23 @@ function detectContinuationChange(params: {
   controls: EffectivePromptControls;
   overrides: CustomPromptOverrides;
   userPrompt: string;
+  customAssetResolution: CustomAssetResolution;
+  curtainApplicability: CurtainApplicability;
 }): string {
-  const { body, controls, overrides, userPrompt } = params;
+  const { body, controls, overrides, userPrompt, customAssetResolution, curtainApplicability } = params;
   const hasCustomInstruction = Boolean(String(userPrompt || "").trim());
   const initialConfig = body.session?.initialConfig;
   if (!initialConfig) {
+    if (customAssetResolution.floorTile) {
+      return hasCustomInstruction
+        ? `Base parameter change: floor tile -> uploaded custom asset "${customAssetResolution.floorTile.asset.name}".`
+        : `Apply only this change: floor tile -> uploaded custom asset "${customAssetResolution.floorTile.asset.name}".`;
+    }
+    if (customAssetResolution.wallFinish) {
+      return hasCustomInstruction
+        ? `Base parameter change: wall finish -> uploaded custom asset "${customAssetResolution.wallFinish.asset.name}".`
+        : `Apply only this change: wall finish -> uploaded custom asset "${customAssetResolution.wallFinish.asset.name}".`;
+    }
     if (overrides.perspective) {
       return hasCustomInstruction
         ? `Base parameter change: camera perspective -> ${controls.perspective}.`
@@ -732,7 +1108,9 @@ function detectContinuationChange(params: {
 
   const changes: string[] = [];
 
-  if (overrides.tile) {
+  if (customAssetResolution.floorTile) {
+    changes.push(`floor tile -> uploaded custom asset "${customAssetResolution.floorTile.asset.name}"`);
+  } else if (overrides.tile) {
     changes.push(`tile/flooring -> ${controls.tile}`);
   } else {
     const currentTile = normalizeControl(body.tile);
@@ -742,16 +1120,26 @@ function detectContinuationChange(params: {
     }
   }
 
-  const currentCurtain = normalizeControl(body.curtain);
-  const initialCurtain = normalizeControl(initialConfig.curtainStyle === "auto" ? "none" : initialConfig.curtainStyle);
-  if (currentCurtain !== initialCurtain) {
-    changes.push(`curtain treatment -> ${normalizeControl(body.curtainName || body.curtain)}`);
+  if (customAssetResolution.curtain) {
+    if (curtainApplicability.allowCurtain) {
+      changes.push(`curtain treatment -> uploaded custom asset "${customAssetResolution.curtain.asset.name}"`);
+    }
+  } else {
+    const currentCurtain = normalizeControl(body.curtain);
+    const initialCurtain = normalizeControl(initialConfig.curtainStyle === "auto" ? "none" : initialConfig.curtainStyle);
+    if (currentCurtain !== initialCurtain) {
+      changes.push(`curtain treatment -> ${normalizeControl(body.curtainName || body.curtain)}`);
+    }
   }
 
-  const currentWallpaper = normalizeControl(body.wallpaper);
-  const initialWallpaper = normalizeControl(initialConfig.wallpaperStyle === "auto" ? "none" : initialConfig.wallpaperStyle);
-  if (currentWallpaper !== initialWallpaper) {
-    changes.push(`wallpaper -> ${normalizeControl(body.wallpaperName || body.wallpaper)}`);
+  if (customAssetResolution.wallFinish) {
+    changes.push(`wall finish -> uploaded custom asset "${customAssetResolution.wallFinish.asset.name}"`);
+  } else {
+    const currentWallpaper = normalizeControl(body.wallpaper);
+    const initialWallpaper = normalizeControl(initialConfig.wallpaperStyle === "auto" ? "none" : initialConfig.wallpaperStyle);
+    if (currentWallpaper !== initialWallpaper) {
+      changes.push(`wall finish -> ${normalizeControl(body.wallpaperName || body.wallpaper)}`);
+    }
   }
 
   if (overrides.wallColor) {
@@ -764,7 +1152,9 @@ function detectContinuationChange(params: {
     }
   }
 
-  if (overrides.furniture) {
+  if (customAssetResolution.furniture) {
+    changes.push(`furniture style -> uploaded custom asset "${customAssetResolution.furniture.asset.name}"`);
+  } else if (overrides.furniture) {
     changes.push(`furniture style -> ${controls.furniture}`);
   } else {
     const currentFurniture = normalizeControl(body.furniture);
@@ -774,10 +1164,14 @@ function detectContinuationChange(params: {
     }
   }
 
-  const currentFabric = normalizeControl(body.fabric);
-  const initialFabric = normalizeControl(initialConfig.fabricStyle === "auto" ? "none" : initialConfig.fabricStyle);
-  if (currentFabric !== initialFabric) {
-    changes.push(`fabric/upholstery -> ${normalizeControl(body.fabricName || body.fabric)}`);
+  if (customAssetResolution.fabric) {
+    changes.push(`fabric/upholstery -> uploaded custom asset "${customAssetResolution.fabric.asset.name}"`);
+  } else {
+    const currentFabric = normalizeControl(body.fabric);
+    const initialFabric = normalizeControl(initialConfig.fabricStyle === "auto" ? "none" : initialConfig.fabricStyle);
+    if (currentFabric !== initialFabric) {
+      changes.push(`fabric/upholstery -> ${normalizeControl(body.fabricName || body.fabric)}`);
+    }
   }
 
   if (overrides.perspective) {
@@ -798,7 +1192,7 @@ function detectContinuationChange(params: {
 
   return hasCustomInstruction
     ? "No base parameter diff detected. Apply Additional user instruction while preserving room geometry/camera lock unless explicitly requested."
-    : "No clear tile/curtain/wallpaper/paint/furniture/fabric diff detected; preserve geometry and camera and only apply explicit user edit text.";
+    : "No clear tile/curtain/wall-finish/paint/furniture/fabric diff detected; preserve geometry and camera and only apply explicit user edit text.";
 }
 
 function buildGenerationPrompt(params: {
@@ -811,26 +1205,67 @@ function buildGenerationPrompt(params: {
   floorPlanAnalysis: string;
   referenceDescriptors: ReferenceAssetDescriptors;
   customAssetBlock: string;
+  customAssetResolution: CustomAssetResolution;
+  curtainApplicability: CurtainApplicability;
+  bathroomWindowPolicy: BathroomWindowPolicy;
 }): string {
   const cameraDescription = perspectiveToCamera(normalizeControl(params.controls.perspective));
-  const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
-  const wallColorHardConstraintLine = buildWallColorHardConstraintLine(params.controls.wallColor);
+  const wallColorPolicyLine = buildWallSurfacePolicyLine({
+    wallColor: params.controls.wallColor,
+    wallFinishOverride: params.customAssetResolution.wallFinish,
+    isBathroom: params.selectedCategoryLabel === "Bathroom",
+    floorTile: params.controls.tile,
+  });
+  const wallSurfaceHardConstraintLines = buildWallSurfaceHardConstraintLines({
+    wallColor: params.controls.wallColor,
+    wallFinishOverride: params.customAssetResolution.wallFinish,
+    isBathroom: params.selectedCategoryLabel === "Bathroom",
+    floorTile: params.controls.tile,
+  });
 
   const materialsBlock = [
     `- Tile/flooring: ${normalizeControl(params.controls.tile)}`,
+    params.customAssetResolution.floorTile
+      ? `- Floor tile override source: uploaded custom asset "${params.customAssetResolution.floorTile.asset.name}" replaces the default floor-tile selection.`
+      : "",
     params.referenceDescriptors.tile ? `- Tile reference details: ${params.referenceDescriptors.tile}` : "",
     "- Tile placement policy: if tile/flooring is specified, apply it only on floor surfaces.",
     "- Tile size policy: if tile/flooring is specified, render as uniform 4x4 square tiles with realistic grout joints.",
     `- Curtains/window treatment: ${normalizeControl(params.controls.curtain)}`,
+    params.customAssetResolution.curtain
+      ? `- Curtain override source: uploaded custom asset "${params.customAssetResolution.curtain.asset.name}" replaces the default curtain selection when the floor plan clearly supports curtains.`
+      : "",
     params.referenceDescriptors.curtain ? `- Curtain reference details: ${params.referenceDescriptors.curtain}` : "",
-    "- Curtain placement policy: if curtains are specified, place them only on logical window/opening treatments with realistic length and fullness.",
-    `- Wallpaper: ${normalizeControl(params.controls.wallpaper)}`,
-    params.referenceDescriptors.wallpaper ? `- Wallpaper reference details: ${params.referenceDescriptors.wallpaper}` : "",
-    "- Wallpaper placement policy: if wallpaper is specified, apply it only to wall surfaces and keep remaining visible painted walls aligned with the selected wall color.",
+    params.curtainApplicability.allowCurtain
+      ? "- Curtain placement policy: if curtains are specified, place them only on logical window/opening treatments with realistic length and fullness."
+      : `- Curtain policy: do not add curtains because ${params.curtainApplicability.reason}`,
+    params.selectedCategoryLabel === "Bathroom"
+      ? params.bathroomWindowPolicy.allowWindow
+        ? params.bathroomWindowPolicy.source === "user"
+          ? "- Bathroom window policy: allow at most one modest logical bathroom window/opening only because the user explicitly requested it."
+          : "- Bathroom window policy: a bathroom window/opening is allowed only because the floor plan clearly indicates one."
+        : `- Bathroom window policy: do not add any exterior bathroom window/opening because ${params.bathroomWindowPolicy.reason}`
+      : "",
+    `- Wall finish: ${normalizeControl(params.controls.wallpaper)}`,
+    params.customAssetResolution.wallFinish
+      ? `- Wall finish override source: uploaded custom asset "${params.customAssetResolution.wallFinish.asset.name}" replaces the default wall-finish selection on the treated wall surfaces.`
+      : "",
+    params.referenceDescriptors.wallpaper ? `- Wall finish reference details: ${params.referenceDescriptors.wallpaper}` : "",
+    params.selectedCategoryLabel === "Bathroom"
+      ? "- Bathroom wall placement policy: use tiled/clad wall surfaces on the main wet-zone or vanity/shower/tub walls; keep any small remaining painted areas aligned with the selected wall color."
+      : "- Wall finish placement policy: if a wall finish is specified, apply it only to wall surfaces and keep remaining visible painted walls aligned with the selected wall color.",
     `- Paint color: ${normalizeControl(params.controls.wallColor)}`,
     `- ${wallColorPolicyLine}`,
     `- Furniture style: ${normalizeControl(params.controls.furniture)}`,
+    params.customAssetResolution.furniture
+      ? `- Furniture override source: uploaded custom asset "${params.customAssetResolution.furniture.asset.name}" replaces conflicting default furniture styling.`
+      : "",
+    params.referenceDescriptors.furniture ? `- Furniture reference details: ${params.referenceDescriptors.furniture}` : "",
+    "- Furniture style policy: if furniture is specified, keep visible furniture silhouettes, finishes, and styling language aligned with that furniture reference while staying appropriate to the room type and floor-plan layout.",
     `- Fabric/upholstery: ${normalizeControl(params.controls.fabric)}`,
+    params.customAssetResolution.fabric
+      ? `- Fabric override source: uploaded custom asset "${params.customAssetResolution.fabric.asset.name}" replaces the default fabric/upholstery selection for matching soft furnishings.`
+      : "",
     params.referenceDescriptors.fabric ? `- Fabric reference details: ${params.referenceDescriptors.fabric}` : "",
     "- Fabric application policy: if fabric is specified, apply it only to upholstery and soft furnishings that naturally belong to the room type.",
   ]
@@ -843,11 +1278,36 @@ function buildGenerationPrompt(params: {
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
-    "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery.",
-    "- If wallpaper is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
+    params.curtainApplicability.allowCurtain
+      ? "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery."
+      : `- Do not add curtains because ${params.curtainApplicability.reason} Never misread door symbols or door-swing arcs as curtains.`,
+    params.selectedCategoryLabel === "Bathroom"
+      ? params.bathroomWindowPolicy.allowWindow
+        ? params.bathroomWindowPolicy.source === "user"
+          ? "- Add at most one modest bathroom window/opening only because the user explicitly requested it. Do not invent extra windows."
+          : "- If a bathroom window/opening is present, keep it limited to the location implied by the floor plan and do not invent extra windows."
+        : `- Do not add any bathroom window or daylight opening because ${params.bathroomWindowPolicy.reason}.`
+      : "",
+    params.selectedCategoryLabel === "Bathroom"
+      ? "- In bathrooms, wall tile/cladding takes priority over plain painted walls unless a higher-priority custom instruction says otherwise."
+      : "- If a wall finish is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
     "- If fabric is specified, apply it only to upholstery or soft furnishings and never to walls, floors, cabinetry, or curtains unless explicitly requested.",
-    "- Treat uploaded custom assets only as style/material/furniture/decor references unless the user explicitly requests structural change.",
-    wallColorHardConstraintLine,
+    params.customAssetResolution.floorTile
+      ? "- The targeted uploaded floor-tile asset overrides any conflicting default floor-tile choice."
+      : "",
+    params.customAssetResolution.wallFinish
+      ? "- The targeted uploaded wall-finish asset overrides any conflicting default wallpaper or wall-finish choice on the treated walls."
+      : "",
+    params.customAssetResolution.furniture
+      ? "- The targeted uploaded furniture asset overrides conflicting default furniture styling."
+      : "",
+    params.customAssetResolution.fabric
+      ? "- The targeted uploaded fabric asset overrides conflicting default upholstery/fabric styling."
+      : "",
+    params.customAssetResolution.curtain && !params.curtainApplicability.allowCurtain
+      ? "- Ignore the targeted curtain asset for this render because the floor plan does not clearly support a curtain treatment."
+      : "",
+    ...wallSurfaceHardConstraintLines,
     "- Do not render as a diagram or sketch or floor plan view.",
     "- Do not hallucinate any elements.",
   ].join("\n");
@@ -890,10 +1350,23 @@ function buildContinuationPrompt(params: {
   overridesSummary: string;
   referenceDescriptors: ReferenceAssetDescriptors;
   customAssetBlock: string;
+  customAssetResolution: CustomAssetResolution;
+  curtainApplicability: CurtainApplicability;
+  bathroomWindowPolicy: BathroomWindowPolicy;
 }): string {
   const hasCustomInstruction = Boolean(String(params.userPrompt || "").trim());
-  const wallColorPolicyLine = buildWallColorPolicyLine(params.controls.wallColor);
-  const wallColorHardConstraintLine = buildWallColorHardConstraintLine(params.controls.wallColor);
+  const wallColorPolicyLine = buildWallSurfacePolicyLine({
+    wallColor: params.controls.wallColor,
+    wallFinishOverride: params.customAssetResolution.wallFinish,
+    isBathroom: params.snippet.label === "Bathroom",
+    floorTile: params.controls.tile,
+  });
+  const wallSurfaceHardConstraintLines = buildWallSurfaceHardConstraintLines({
+    wallColor: params.controls.wallColor,
+    wallFinishOverride: params.customAssetResolution.wallFinish,
+    isBathroom: params.snippet.label === "Bathroom",
+    floorTile: params.controls.tile,
+  });
   const hardConstraints = [
     "- Lock room geometry exactly as previous generated image.",
     params.allowPerspectiveChange
@@ -908,11 +1381,36 @@ function buildContinuationPrompt(params: {
     "- If tile/flooring is specified, apply tile texture only to floor surfaces.",
     "- Never apply tile texture to walls, wardrobes, cabinets, furniture, upholstery, ceiling, doors, or decor.",
     "- If tile/flooring is specified, use a consistent 4x4 square tile grid with realistic scale and grout spacing.",
-    "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery.",
-    "- If wallpaper is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
+    params.curtainApplicability.allowCurtain
+      ? "- If curtains are specified, apply them only to windows/openings and never as wall panels, room dividers, or upholstery."
+      : `- Do not add curtains because ${params.curtainApplicability.reason} Never misread door symbols or door-swing arcs as curtains.`,
+    params.snippet.label === "Bathroom"
+      ? params.bathroomWindowPolicy.allowWindow
+        ? params.bathroomWindowPolicy.source === "user"
+          ? "- Add at most one modest bathroom window/opening only if needed to satisfy the explicit user request. Do not invent extra windows."
+          : "- Do not introduce any new bathroom window/opening beyond what is logically supported by the floor plan."
+        : `- Do not introduce any bathroom window or daylight opening because ${params.bathroomWindowPolicy.reason}.`
+      : "",
+    params.snippet.label === "Bathroom"
+      ? "- In bathrooms, preserve or apply realistic wall tile/cladding on the main wet-zone walls unless a higher-priority custom instruction explicitly removes it."
+      : "- If a wall finish is specified, apply it only to wall surfaces and never to floors, ceilings, curtains, furniture, cabinetry, or decor.",
     "- If fabric is specified, apply it only to upholstery or soft furnishings and never to walls, floors, cabinetry, or curtains unless explicitly requested.",
-    "- Treat uploaded custom assets only as style/material/furniture/decor references unless the user explicitly requests structural change.",
-    wallColorHardConstraintLine,
+    params.customAssetResolution.floorTile
+      ? "- The targeted uploaded floor-tile asset overrides any conflicting default floor-tile choice."
+      : "",
+    params.customAssetResolution.wallFinish
+      ? "- The targeted uploaded wall-finish asset overrides any conflicting default wallpaper or wall-finish choice on the treated walls."
+      : "",
+    params.customAssetResolution.furniture
+      ? "- The targeted uploaded furniture asset overrides conflicting default furniture styling."
+      : "",
+    params.customAssetResolution.fabric
+      ? "- The targeted uploaded fabric asset overrides conflicting default upholstery/fabric styling."
+      : "",
+    params.customAssetResolution.curtain && !params.curtainApplicability.allowCurtain
+      ? "- Ignore the targeted curtain asset for this render because the floor plan does not clearly support a curtain treatment."
+      : "",
+    ...wallSurfaceHardConstraintLines,
     hasCustomInstruction
       ? "- Keep walls, openings, and structural proportions fixed. Object-level additions/styling are allowed only if requested above."
       : "- Do not alter object positions, walls, openings, proportions, or composition.",
@@ -929,7 +1427,8 @@ function buildContinuationPrompt(params: {
     params.changeInstruction,
     params.referenceDescriptors.tile ? `Tile reference details: ${params.referenceDescriptors.tile}` : "",
     params.referenceDescriptors.curtain ? `Curtain reference details: ${params.referenceDescriptors.curtain}` : "",
-    params.referenceDescriptors.wallpaper ? `Wallpaper reference details: ${params.referenceDescriptors.wallpaper}` : "",
+    params.referenceDescriptors.wallpaper ? `Wall finish reference details: ${params.referenceDescriptors.wallpaper}` : "",
+    params.referenceDescriptors.furniture ? `Furniture reference details: ${params.referenceDescriptors.furniture}` : "",
     params.referenceDescriptors.fabric ? `Fabric reference details: ${params.referenceDescriptors.fabric}` : "",
     wallColorPolicyLine,
     `Camera template guidance: ${params.snippet.camera}`,
@@ -960,20 +1459,58 @@ export async function buildPromptAndContext(
   const previousRenderedImages = body.session?.previousRenderedImages?.slice(-2) || [];
   const latestRenderedImage = body.session?.latestRenderedImage || null;
   const isContinuation = Boolean(latestRenderedImage);
-  const categoryKey = normalizeCategoryKey(body.category);
+  const isAutoCategory = isAutoCategorySelection(body.category);
+  let categoryKey = normalizeCategoryKey(body.category);
+  let resolvedCategoryLabel = CATEGORY_SNIPPETS[categoryKey].label;
+  const sessionDetectedCategory = String(body.session?.detectedCategory || "").trim();
+
+  if (isAutoCategory) {
+    if (!isContinuation && body.image) {
+      const detected = await runAutoCategoryDetection({ imageDataUrl: body.image });
+      categoryKey = detected.categoryKey;
+      resolvedCategoryLabel = detected.label;
+    } else if (sessionDetectedCategory) {
+      categoryKey = normalizeCategoryKey(sessionDetectedCategory);
+      resolvedCategoryLabel = CATEGORY_SNIPPETS[categoryKey].label;
+    }
+  }
+
   const snippet = CATEGORY_SNIPPETS[categoryKey];
   const isBathroomCategory = categoryKey === "bathroom";
   const { userPrompt: cleanedUserPrompt, overrides } = extractCustomPromptAndOverrides(body.prompt);
   const userPrompt = polishPromptText(cleanedUserPrompt);
-  const controls = resolveEffectiveControls(body, overrides);
-  const referenceDescriptors: ReferenceAssetDescriptors = {
-    tile: "",
-    curtain: "",
-    wallpaper: "",
-    fabric: "",
-  };
   const customAssets = sanitizeCustomAssets(body.customAssets);
   const analyzedCustomAssetDescriptors: Record<string, string> = {};
+
+  for (const asset of customAssets) {
+    try {
+      analyzedCustomAssetDescriptors[asset.id] = await runCustomAssetAnalysis({
+        imageDataUrl: asset.previewUrl,
+        assetName: asset.name,
+        userPrompt: asset.prompt,
+        useAs: asset.useAs,
+      });
+    } catch (error) {
+      console.warn("[Prompt Builder] Custom asset analysis failed. Continuing without descriptor.", {
+        assetName: asset.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      analyzedCustomAssetDescriptors[asset.id] = "";
+    }
+  }
+
+  const customAssetResolution = resolveCustomAssetOverrides({
+    customAssets,
+    analyzedDescriptors: analyzedCustomAssetDescriptors,
+  });
+  const controls = resolveEffectiveControls(body, overrides, customAssetResolution);
+  const referenceDescriptors: ReferenceAssetDescriptors = {
+    tile: customAssetResolution.floorTile?.descriptor || "",
+    curtain: customAssetResolution.curtain?.descriptor || "",
+    wallpaper: customAssetResolution.wallFinish?.descriptor || "",
+    furniture: customAssetResolution.furniture?.descriptor || "",
+    fabric: customAssetResolution.fabric?.descriptor || "",
+  };
   const overridesSummary = buildOverridesSummary(overrides, controls);
 
   const referenceAssets: Array<{
@@ -988,25 +1525,35 @@ export async function buildPromptAndContext(
       imageDataUrl: body.tileImage,
       selectedValue: normalizeControl(body.tile),
       selectedName: normalizeControl(controls.tile),
-      skipBecauseOverride: Boolean(overrides.tile),
+      skipBecauseOverride: Boolean(overrides.tile || customAssetResolution.floorTile),
     },
     {
       kind: "curtain",
       imageDataUrl: body.curtainImage,
       selectedValue: normalizeControl(body.curtain),
       selectedName: normalizeControl(controls.curtain),
+      skipBecauseOverride: Boolean(customAssetResolution.curtain),
     },
     {
       kind: "wallpaper",
       imageDataUrl: body.wallpaperImage,
       selectedValue: normalizeControl(body.wallpaper),
       selectedName: normalizeControl(controls.wallpaper),
+      skipBecauseOverride: Boolean(customAssetResolution.wallFinish),
+    },
+    {
+      kind: "furniture",
+      imageDataUrl: body.furnitureImage,
+      selectedValue: normalizeControl(body.furniture),
+      selectedName: normalizeControl(controls.furniture),
+      skipBecauseOverride: Boolean(overrides.furniture || customAssetResolution.furniture),
     },
     {
       kind: "fabric",
       imageDataUrl: body.fabricImage,
       selectedValue: normalizeControl(body.fabric),
       selectedName: normalizeControl(controls.fabric),
+      skipBecauseOverride: Boolean(customAssetResolution.fabric),
     },
   ];
 
@@ -1030,25 +1577,62 @@ export async function buildPromptAndContext(
     }
   }
 
-  for (const asset of customAssets) {
-    try {
-      analyzedCustomAssetDescriptors[asset.id] = await runCustomAssetAnalysis({
-        imageDataUrl: asset.previewUrl,
-        assetName: asset.name,
-        userPrompt: asset.prompt,
-      });
-    } catch (error) {
-      console.warn("[Prompt Builder] Custom asset analysis failed. Continuing without descriptor.", {
-        assetName: asset.name,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      analyzedCustomAssetDescriptors[asset.id] = "";
-    }
+  const shouldEvaluateCurtains = !isContinuation
+    && Boolean(body.image)
+    && (normalizeControl(body.curtain) !== "auto" || Boolean(customAssetResolution.curtain));
+
+  const curtainApplicability = shouldEvaluateCurtains
+    ? await runCurtainApplicabilityAnalysis({
+        imageDataUrl: String(body.image || ""),
+        selectedCategoryLabel: snippet.label,
+      })
+    : {
+        allowCurtain: true,
+        reason: "Curtains are allowed only when a logical window/opening exists.",
+      };
+
+  if (!curtainApplicability.allowCurtain) {
+    controls.curtain = "auto";
+    referenceDescriptors.curtain = "";
   }
 
+  const windowPreference = detectBathroomWindowPreference(userPrompt);
+  const shouldEvaluateBathroomWindow = !isContinuation
+    && Boolean(body.image)
+    && isBathroomCategory
+    && windowPreference === "unspecified";
+
+  const bathroomWindowPolicy: BathroomWindowPolicy = windowPreference === "allow"
+    ? {
+        allowWindow: true,
+        reason: "the user explicitly requested a bathroom window/opening",
+        source: "user",
+      }
+    : windowPreference === "disallow"
+      ? {
+          allowWindow: false,
+          reason: "the user explicitly requested no bathroom window/opening",
+          source: "user",
+        }
+      : shouldEvaluateBathroomWindow
+        ? await runBathroomWindowApplicabilityAnalysis({
+            imageDataUrl: String(body.image || ""),
+            selectedCategoryLabel: resolvedCategoryLabel,
+          }).then((result) => ({
+            allowWindow: result.allowWindow,
+            reason: result.reason,
+            source: result.allowWindow ? "plan" as const : "default" as const,
+          }))
+        : {
+            allowWindow: !isBathroomCategory,
+            reason: isBathroomCategory
+              ? "no clear bathroom window/opening was visible in the floor plan and the user did not request one"
+              : "window policy is not restricted for this room type",
+            source: "default",
+          };
+
   const customAssetBlock = buildCustomAssetInstructionBlock({
-    customAssets,
-    analyzedDescriptors: analyzedCustomAssetDescriptors,
+    resolution: customAssetResolution,
   });
 
   let prompt: string;
@@ -1059,34 +1643,46 @@ export async function buildPromptAndContext(
       controls,
       allowPerspectiveChange: Boolean(overrides.perspective),
       userPrompt,
-      changeInstruction: detectContinuationChange({ body, controls, overrides, userPrompt }),
+      changeInstruction: detectContinuationChange({
+        body,
+        controls,
+        overrides,
+        userPrompt,
+        customAssetResolution,
+        curtainApplicability,
+      }),
       overridesSummary,
-      referenceDescriptors,
-      customAssetBlock,
-    });
+        referenceDescriptors,
+        customAssetBlock,
+        customAssetResolution,
+        curtainApplicability,
+        bathroomWindowPolicy,
+      });
   } else {
     if (!body.image) {
       throw createTypedError("Missing floor plan image for validation/analysis.", 400, "MISSING_IMAGE");
     }
 
-    const validation = await runCategoryValidation({
-      imageDataUrl: body.image,
-      selectedCategoryLabel: snippet.label,
-    });
+    if (!isAutoCategory) {
+      const validation = await runCategoryValidation({
+        imageDataUrl: body.image,
+        selectedCategoryLabel: resolvedCategoryLabel,
+      });
 
-    if (!validation.isMatch) {
-      throw createMismatchError(validation.reason);
+      if (!validation.isMatch) {
+        throw createMismatchError(validation.reason);
+      }
     }
 
     const elements = await runVisibleElementAnalysis({
       imageDataUrl: body.image,
-      selectedCategoryLabel: snippet.label,
+      selectedCategoryLabel: resolvedCategoryLabel,
       expectedElements: snippet.elementsToLookFor,
     });
 
     prompt = buildGenerationPrompt({
       snippet,
-      selectedCategoryLabel: snippet.label,
+      selectedCategoryLabel: resolvedCategoryLabel,
       elementPlacementBlock: formatElementPlacementBlock(elements),
       controls,
       userPrompt,
@@ -1094,12 +1690,16 @@ export async function buildPromptAndContext(
       floorPlanAnalysis,
       referenceDescriptors,
       customAssetBlock,
+      customAssetResolution,
+      curtainApplicability,
+      bathroomWindowPolicy,
     });
   }
 
   return {
     prompt,
     isBathroomCategory,
+    resolvedCategoryLabel,
     previousRenderedImages,
     latestRenderedImage,
   };

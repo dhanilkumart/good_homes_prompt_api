@@ -34,7 +34,7 @@ function loadEnvFiles() {
 loadEnvFiles();
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 function summarizeDataUrl(value: unknown) {
   if (!value || typeof value !== "string") return null;
@@ -55,6 +55,7 @@ function summarizeCustomAssets(value: unknown) {
     return {
       id: record.id || null,
       name: record.name || null,
+      useAs: record.useAs || null,
       promptLength: record.prompt ? String(record.prompt).length : 0,
       hasPreviewUrl: Boolean(record.previewUrl),
     };
